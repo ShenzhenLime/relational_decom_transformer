@@ -1,4 +1,4 @@
-from layers.TDformer_EncDec import EncoderLayer, Encoder, DecoderLayer, Decoder, AttentionLayer, series_decomp, series_decomp_multi,series_decomp_res,series_decomp_multi_res
+from layers.TDformer_EncDec import EncoderLayer, Encoder, DecoderLayer, Decoder, AttentionLayer, series_decomp_multi,series_decomp_res,series_decomp_multi_res
 import torch.nn as nn
 import torch
 from layers.Embed import DataEmbedding
@@ -31,7 +31,7 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.output_attention = configs.output_attention
         self.output_stl = configs.output_stl
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(getattr(configs, 'device', 'cpu'))
 
         # Decomp
         kernel_size = configs.moving_avg
@@ -79,7 +79,8 @@ class Model(nn.Module):
                                                   output_attention=configs.output_attention)
             dec_cross_attention = FourierAttention(T=configs.temp, activation=configs.activation,
                                                    output_attention=configs.output_attention)
-        elif configs.version == 'Time':
+        # elif configs.version == 'Time':
+        else:
             ## True Flase为是否对未来数据进行掩码（填充为负无穷，最后做softmax就为0
             enc_self_attention = FullAttention(False, T=configs.temp, activation=configs.activation,
                                                attention_dropout=configs.dropout,
@@ -152,7 +153,7 @@ class Model(nn.Module):
 
 
         # Residual
-        self.revin_trend = RevIN(configs.enc_in).to(self.device)
+        self.revin_residual = RevIN(configs.enc_in).to(self.device)
         self.revin_volatility = RevIN(configs.d_model).to(self.device)
         self.residual_lstm = nn.LSTM(configs.enc_in, configs.d_model, batch_first=True)
         self.residual_proj = nn.Linear(configs.d_model, configs.c_out)
@@ -165,16 +166,11 @@ class Model(nn.Module):
             nn.ReLU(),
             nn.Linear(configs.d_model, configs.pred_len)
         )
-        self.residual_Linear=nn.Linear(configs.seq_len,configs.pred_len)
+        # self.residual_Linear=nn.Linear(configs.seq_len,configs.pred_len)
         
         self.full_attention = FullAttention(mask_flag=False, T=configs.temp, activation=configs.activation, output_attention=False)
 
-        self.finalprojection = nn.Sequential(
-            nn.Linear(configs.enc_in, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2)
-        )
-        self.projector2 = nn.Linear(configs.enc_in, 2, bias=True)
+        self.projector2 = nn.Linear(configs.c_out, 2, bias=True)
         
         
         # Gated Layers
@@ -235,7 +231,7 @@ class Model(nn.Module):
         
 
         ## Residual（REVIN -> MLP -> LSTM -> REVIN -> MLP ）
-        residual_out=self.revin_trend(residual_enc, 'norm')          # Eq.18
+        residual_out=self.revin_residual(residual_enc, 'norm')          # Eq.18
         residual_out = self.residual_mlp(residual_out.permute(0, 2, 1)).permute(0, 2, 1)  # Eq.19-20
 
         # LSTM
@@ -266,10 +262,6 @@ class Model(nn.Module):
 
         # ACC
         dec_out=self.projector2(dec_out)
-        output=dec_out[:, -self.pred_len:, :]
-        
-        
-        
-        output = F.elu((output))
-        output=F.log_softmax(output, dim=1)
+        output = F.elu(dec_out)
+        output=F.log_softmax(output, dim=2)
         return output

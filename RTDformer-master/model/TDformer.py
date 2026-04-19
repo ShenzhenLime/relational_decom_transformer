@@ -19,7 +19,7 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.output_attention = configs.output_attention
         self.output_stl = configs.output_stl
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(getattr(configs, 'device', 'cpu'))
 
         # Decomp
         kernel_size = configs.moving_avg

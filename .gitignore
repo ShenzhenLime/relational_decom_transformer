@@ -1,1 +1,6 @@
 local/
+RTDformer-master/data
+RTDformer-master/paper
+RTDformer-master/deploy
+*.pt
+*.zip

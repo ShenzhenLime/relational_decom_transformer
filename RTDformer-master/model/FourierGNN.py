@@ -40,7 +40,6 @@ class Model(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(self.hidden_size, self.pre_length)
         )
-        self.to('cuda:1')
         self.projector2 = nn.Linear(configs.enc_in, 2, bias=True)
 
     def tokenEmb(self, x):

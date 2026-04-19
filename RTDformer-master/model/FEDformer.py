@@ -11,9 +11,6 @@ import math
 import numpy as np
 
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
 class Model(nn.Module):
     """
     FEDformer performs the attention mechanism on frequency domain and achieved O(N) complexity
@@ -74,7 +71,7 @@ class Model(nn.Module):
         # Encoder
         enc_modes = int(min(configs.modes, configs.seq_len//2))
         dec_modes = int(min(configs.modes, (configs.seq_len//2+configs.pred_len)//2))
-        print('enc_modes: {}, dec_modes: {}'.format(enc_modes, dec_modes))
+        print(f'enc_modes: {enc_modes}, dec_modes: {dec_modes}')
 
         self.encoder = Encoder(
             [
@@ -122,7 +119,7 @@ class Model(nn.Module):
         mean = torch.mean(x_enc, dim=1).unsqueeze(1).repeat(1, self.pred_len, 1)
         
 #         print(mean.shape) #torch.Size([155, 48, 4])
-        zeros = torch.zeros([x_dec.shape[0], self.pred_len, x_dec.shape[2]]).to(device)  # cuda()
+        zeros = torch.zeros([x_dec.shape[0], self.pred_len, x_dec.shape[2]], device=x_dec.device)
         seasonal_init, trend_init = self.decomp(x_enc)
         
         

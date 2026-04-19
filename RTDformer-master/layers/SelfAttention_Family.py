@@ -60,9 +60,9 @@ class FlashAttention(nn.Module):
         l = torch.zeros(Q.shape[:-1])[..., None]
         m = torch.ones(Q.shape[:-1])[..., None] * NEG_INF
 
-        O = O.to(device='cuda')
-        l = l.to(device='cuda')
-        m = m.to(device='cuda')
+        O = O.to(device=Q.device)
+        l = l.to(device=Q.device)
+        m = m.to(device=Q.device)
 
         Q_BLOCK_SIZE = min(BLOCK_SIZE, Q.shape[-1])
         KV_BLOCK_SIZE = BLOCK_SIZE

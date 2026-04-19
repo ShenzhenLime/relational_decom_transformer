@@ -1,0 +1,9 @@
+# Cloud training minimal dependencies for RTDformer2.
+# This file intentionally excludes duckdb / quant_infra related packages.
+# Prepare the .pt dataset locally, then upload it together with the code bundle.
+
+numpy>=2.3.3
+pandas>=2.3.3
+torch>=2.11.0
+scikit-learn>=1.8.0
+tqdm>=4.67.3

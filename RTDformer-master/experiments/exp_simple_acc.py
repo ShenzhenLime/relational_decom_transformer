@@ -1,304 +1,255 @@
 from data_provider.data_match import data_provider
 
 from experiments.exp_basic import Exp_Basic
-from utils.tools import EarlyStopping_1, adjust_learning_rate, visual
-from utils.metrics import metric
+from utils.tools import EarlyStopping, adjust_learning_rate
 import torch
 import torch.nn as nn
 from torch import optim
 import os
+import json
 import time
 import warnings
 import numpy as np
-import torch.nn.functional as F
+import pandas as pd
+from utils.device_utils import (
+    autocast_context,
+    create_grad_scaler,
+    device_memory_snapshot,
+    format_memory_snapshot,
+    load_checkpoint,
+    manage_device_memory,
+    oom_diagnostics_message,
+)
 
 warnings.filterwarnings('ignore')
 
-from sklearn.metrics import accuracy_score, roc_auc_score, recall_score, f1_score
+from sklearn.metrics import roc_auc_score, recall_score, f1_score
 
 
 def calculate_metrics(pred, true, threshold=0.51):
-    trues = true
-    #     print(pred)
     preds = torch.softmax(pred, dim=1)
-
-    #     print(preds)
-    #
-
-    #      # 检查 NaN
-    #     if torch.isnan(pred).any():
-    #         raise ValueError("NaN detected in preds")
-    #     if torch.isnan(trues).any():
-    #         raise ValueError("NaN detected in trues")
-    #     preds=F.softmax(pred, dim=1)
-
-    #     print(pred.shape)
     predicted_labels = (preds[:, 1] >= threshold).float()
-    # 计算准确率
-    accuracy = (predicted_labels == trues).float().mean()
-    acc = sum(predicted_labels == trues) / len(trues)
-    auc = roc_auc_score(trues, preds[:, 1])
-    # 计算召回率
-    recall = recall_score(trues, predicted_labels, average='binary')
-    # 计算F1得分
-    F1 = f1_score(trues, predicted_labels, average='binary')
-
-    #     TP=0
-    #     TN=0
-    #     FP=0
-    #     FN=0
-    #     for i in range (len(true)):
-
-    #         if true[i]==1 and predicted_labels[i]==1:
-    #             TP=TP+1
-    #         if true[i]==0 and predicted_labels[i]==0:
-    #             TN=TN+1
-    #         if true[i]==0 and predicted_labels[i]==1:
-    #             FP=FP+1
-    #         if true[i]==1 and predicted_labels[i]==0:
-    #             FN=FN+1
-
-    #     ACC=(TP+TN)/(FP+FN+TP+TN)
-    #     Precision=(TP)/(TP+FP)
-    #     Recall= TP/(TP+FN)
-    #     F1_M=2*(Precision*Recall)/(Precision+Recall)
-
-    return acc, auc, recall, F1
-
-
-# def calculate_metrics(pred, true):
-
-#     preds = pred
-# #     print(preds.shape)
-#     trues = true
-# #     print(trues.shape)
-#     # 计算准确率
-#     predicted_labels = torch.argmax(preds, dim=1)
-#     accuracy = (predicted_labels == trues).float().mean()
-
-#     acc = sum(preds.argmax(-1) == trues) / len(trues)
-
-# #     print(f'acc:{acc},acc_1{accuracy}')   #这里说明，acc计算公式没问题，因为accuracy==acc
-
-#     auc = roc_auc_score(trues,preds[:,1])  #AUC也没有问题
-
-#     # 计算召回率
-# #     recall = recall_score(true, pred)
-#     recall = recall_score(trues, preds.argmax(-1), average='binary')
-
-# #     # 计算F1得分
-# #     f1 = f1_score(true, pred)
-#     F1=f1_score(trues, preds.argmax(-1), average='binary')
-# #     f1 = f1_score(trues, predicted_labels)
-# #     print(f'F1:{F1},gpt的f1：{f1}')
-
-#     return acc, auc, recall, F1
+    acc = sum(predicted_labels == true) / len(true)
+    try:
+        auc = roc_auc_score(true, preds[:, 1])
+    except ValueError:
+        auc = float('nan')
+    recall = recall_score(true, predicted_labels, average='binary', zero_division=0)
+    f1 = f1_score(true, predicted_labels, average='binary', zero_division=0)
+    return acc, auc, recall, f1
 
 
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
-        super(Exp_Long_Term_Forecast, self).__init__(args)
-        self.print_debug = False  # 添加一个参数来控制是否打印调试信息
+        super().__init__(args)
+        self.print_debug = False
+
+    @staticmethod
+    def _format_metric(value):
+        numeric_value = float(value)
+        if np.isnan(numeric_value):
+            return 'nan'
+        return f'{numeric_value:.6f}'
+
+    def _print_stage(self, stage, message):
+        print(f'[{stage}] {message}')
+
+    def _print_metric_block(self, stage, loss, acc, auc, recall, f1):
+        self._print_stage(
+            stage,
+            (
+                f'loss={self._format_metric(loss)} | acc={self._format_metric(acc)} | '
+                f'auc={self._format_metric(auc)} | recall={self._format_metric(recall)} | '
+                f'f1={self._format_metric(f1)}'
+            )
+        )
+
+    def _ensure_dir(self, folder_path):
+        os.makedirs(folder_path, exist_ok=True)
+        return folder_path
+
+    def _setting_dir(self, base_dir, setting):
+        return self._ensure_dir(os.path.join(base_dir, setting))
+
+    def _save_json(self, file_path, payload):
+        parent_dir = os.path.dirname(file_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _save_run_config(self, setting):
+        record_dir = self._setting_dir(self.args.run_records_dir, setting)
+        self._save_json(os.path.join(record_dir, 'args.json'), vars(self.args))
+        return record_dir
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
-
-        if self.args.use_multi_gpu and self.args.use_gpu:
+        if self.args.use_multi_gpu and self.args.device_type == 'cuda':
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
 
     def _get_data(self, flag):
-        data_set, data_loader = data_provider(self.args, flag, print_debug=self.print_debug)
-        return data_set, data_loader
+        return data_provider(self.args, flag, print_debug=self.print_debug)
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        return model_optim
+        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
-        criterion = nn.NLLLoss()
-        return criterion
+        return nn.NLLLoss()
+
+    def _debug_max_batches(self):
+        if self.args.device_type == 'xpu' and getattr(self.args, 'xpu_debug_mode', False):
+            return max(1, int(getattr(self.args, 'xpu_debug_max_batches', 2)))
+        return None
+
+    def _debug_break(self, batch_index):
+        max_batches = self._debug_max_batches()
+        return max_batches is not None and batch_index >= max_batches
+
+    def _should_cleanup_after_batch(self, batch_index):
+        if self.args.device_type != 'xpu':
+            return False
+        interval = max(0, int(getattr(self.args, 'xpu_memory_cleanup_interval', 0)))
+        return interval > 0 and (batch_index + 1) % interval == 0
+
+    def _manage_runtime_memory(self, stage, batch_index=None, force_gc=False, reset_peak=False):
+        manage_device_memory(self.args.device_type, force_gc=force_gc, reset_peak=reset_peak)
+        if self.args.device_type != 'xpu':
+            return
+        if getattr(self.args, 'xpu_log_memory', False):
+            prefix = stage if batch_index is None else f'{stage} batch={batch_index + 1}'
+            self._print_stage('内存', f'{prefix} | {format_memory_snapshot(device_memory_snapshot(self.args.device_type))}')
+
+    def _handle_oom(self, stage, exc):
+        self._manage_runtime_memory(stage, force_gc=True)
+        raise RuntimeError(oom_diagnostics_message(self.args.device_type, stage, exc)) from exc
+
+    def _build_decoder_input(self, batch_y):
+        """构造 decoder 输入：已知标签部分 + 零填充预测部分"""
+        dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+        return torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+
+    def _forward(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name):
+        """统一的模型前向传播，处理 AMP 和 output_attention"""
+        from contextlib import nullcontext
+        try:
+            ctx = autocast_context(self.args) if self.args.use_amp else nullcontext()
+            with ctx:
+                result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                return result[0] if self.args.output_attention else result
+        except torch.OutOfMemoryError as exc:
+            self._handle_oom(stage_name, exc)
+
+    def _extract_target_labels(self, batch_y, as_int=False):
+        """从 batch_y 中提取目标标签：取预测区间、相对首日涨跌二分类"""
+        f_dim = -1 if self.args.features == 'MS' else 0
+        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+        batch_y = batch_y - batch_y[:, :1, :]
+        return (batch_y > 0).int() if as_int else (batch_y > 0).float()
+
+    def _prepare_batch(self, batch):
+        batch_x, batch_y, batch_x_mark, batch_y_mark, stock_mask = batch
+
+        batch_x = batch_x.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+        batch_x_mark = batch_x_mark.float().to(self.device)
+        batch_y_mark = batch_y_mark.float().to(self.device)
+        stock_mask = stock_mask.to(self.device).bool().reshape(-1)
+
+        batch_x = batch_x.reshape(-1, batch_x.shape[2], batch_x.shape[3])
+        batch_y = batch_y.reshape(-1, batch_y.shape[2], batch_y.shape[3])
+        batch_x_mark = batch_x_mark.reshape(-1, batch_x_mark.shape[2], batch_x_mark.shape[3])
+        batch_y_mark = batch_y_mark.reshape(-1, batch_y_mark.shape[2], batch_y_mark.shape[3])
+
+        if not stock_mask.any():
+            raise ValueError('当前 batch 没有任何满足窗口覆盖条件的股票。')
+
+        batch_x = batch_x[stock_mask]
+        batch_y = batch_y[stock_mask]
+        batch_x_mark = batch_x_mark[stock_mask]
+        batch_y_mark = batch_y_mark[stock_mask]
+        return batch_x, batch_y, batch_x_mark, batch_y_mark
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
         preds = []
         trues = []
+        stage_name = '验证'
 
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+            for i, batch in enumerate(vali_loader):
+                if self._debug_break(i):
+                    break
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
+                dec_inp = self._build_decoder_input(batch_y)
+                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
-                # 测试用，用完删
-                batch_x = batch_x.reshape(-1, batch_x.shape[2], batch_x.shape[3])
-                batch_y = batch_y.reshape(-1, batch_y.shape[2], batch_y.shape[3])
-                batch_x_mark = batch_x_mark.reshape(-1, batch_x_mark.shape[2], batch_x_mark.shape[3])
-                batch_y_mark = batch_y_mark.reshape(-1, batch_y_mark.shape[2], batch_y_mark.shape[3])
-
-                #                 first_day_values = batch_y[:, :1, :]
-                #                 target_y = batch_y[:, :48, :]
-                #                 target_y -= first_day_values
-                #                 target_y = (target_y > 0).float()
-                #                 batch_y[:, :48, :] = target_y
-
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                f_dim = -1 if self.args.features == 'MS' else 0
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-
-                #                 print(outputs.shape)
-                #                 outputs=torch.softmax(outputs,dim=2)
-
-                # 第一种：大于0
-
-                first_day_values = batch_y[:, :1, :]
-                batch_y -= first_day_values
-                batch_y = (batch_y > 0).int()
-
-                #                 # 修改版本
-                #                 preds.append(outputs.detach().cpu())
-                #                 trues.append(batch_y.detach().cpu())
-
+                batch_y = self._extract_target_labels(batch_y, as_int=True)
                 outputs = outputs.reshape(-1, 2)
                 batch_y = batch_y.reshape(-1).to(torch.long)
 
-                pred = outputs.detach().cpu()
-                #                 print(pred)
-                true = batch_y.detach().cpu()
+                preds.append(outputs.detach().cpu())
+                trues.append(batch_y.detach().cpu())
+                total_loss.append(criterion(outputs, batch_y).item())
 
-                #                 if torch.isnan(pred).any():
-                #                     print("NaN detected in pred")
+                if self._should_cleanup_after_batch(i):
+                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
-                #                 if torch.isnan(true).any():
-                #                     print("NaN detected in true")
-
-                #                  原版
-
-                preds.append(pred)
-                trues.append(true)
-
-                loss = criterion(outputs, batch_y)
-
-                total_loss.append(loss)
-
-        #         preds = np.array(preds)
-        preds_tensor = torch.cat(preds, dim=0)
-
-        #         print(preds_tensor.shape)  #torch.Size([135315, 48, 2])
-
-        trues_tensor = torch.cat(trues, dim=0)
-
-        #         print(trues_tensor.shape)  #torch.Size([135315, 48, 1])
-
-        acc, auc, recall, f1 = calculate_metrics(preds_tensor, trues_tensor)  # ( 57, 5520, 2) ,#(57, 5520)
-
-        total_loss = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in total_loss]
-
+        acc, auc, recall, f1 = calculate_metrics(torch.cat(preds, dim=0), torch.cat(trues, dim=0))
         total_loss = np.average(total_loss)
         self.model.train()
+        self._manage_runtime_memory(stage_name, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
-        #         print("已经循环一遍了")
         return total_loss, acc, auc, recall, f1
-
-    #         return total_loss
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
 
+        self._print_stage('训练', f'开始训练，实验标识: {setting}')
+        record_dir = self._save_run_config(setting)
+
         path = os.path.join(self.args.checkpoints, setting)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        self._ensure_dir(path)
 
         time_now = time.time()
 
-        train_steps = len(train_loader)  # 7
-        early_stopping = EarlyStopping_1(patience=self.args.patience, verbose=True)
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
         if self.args.use_amp:
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = create_grad_scaler(self.args)
 
-        eval_epoch_best = 0
+        self._manage_runtime_memory('训练初始化', force_gc=True, reset_peak=True)
 
-        for epoch in range(self.args.train_epochs):  # 20
+        for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
             self.model.train()
             epoch_time = time.time()
+            speed = 0.0
+            left_time = 0.0
+            stage_name = f'训练 epoch={epoch + 1}'
 
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+            for i, batch in enumerate(train_loader):
+                if self._debug_break(i):
+                    break
 
                 iter_count += 1
                 model_optim.zero_grad()
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
+                dec_inp = self._build_decoder_input(batch_y)
+                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
-                # 将 Batch 和 Stocks 拍扁为一维，以便后续处理，reshape(-1, 时间长度, 特征数)
-                batch_x = batch_x.reshape(-1, batch_x.shape[2], batch_x.shape[3])
-                batch_y = batch_y.reshape(-1, batch_y.shape[2], batch_y.shape[3])
-                batch_x_mark = batch_x_mark.reshape(-1, batch_x_mark.shape[2], batch_x_mark.shape[3])
-                batch_y_mark = batch_y_mark.reshape(-1, batch_y_mark.shape[2], batch_y_mark.shape[3])
-
-                #                 first_day_values = batch_y[:, :1, :]
-                #                 target_y = batch_y[:, :48, :]
-                #                 target_y -= first_day_values
-                #                 target_y = (target_y > 0).float()
-                #                 batch_y[:, :48, :] = target_y
-
-                # decoder input
-                # 将要预测的部分用0填充，前面是已知的部分，一同拼接作为decoder的输入
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                f_dim = -1 if self.args.features == 'MS' else 0
-
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-
-                # 第一种：大于0
-                first_day_values = batch_y[:, :1, :]
-                batch_y -= first_day_values
-                batch_y = (batch_y > 0).float()
-
-                # 第二种：
-                #                    batch_y /= first_day_values
-                #                    batch_y = (batch_y > 0.0001).float()
-
+                batch_y = self._extract_target_labels(batch_y)
                 outputs = outputs.reshape(-1, 2)
                 batch_y = batch_y.reshape(-1).to(torch.long)
 
@@ -318,208 +269,194 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 else:
                     loss.backward()
                     model_optim.step()
+                if self._should_cleanup_after_batch(i):
+                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
+            completed_steps = len(train_loss)
             train_loss = np.average(train_loss)
 
-            print(train_loss)
             vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
             test_loss, test_acc, test_auc, test_recall, test_F1 = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}\n "
-                  "Vali Acc: {5:.7f} Vali AUC: {6:.7f} Vali Recall: {7:.7f} Vali F1: {8:.7f}\n "
-                  "Test Acc: {9:.7f} Test AUC: {10:.7f} Test Recall: {11:.7f} Test F1: {12:.7f}\n".format(
-                epoch + 1, train_steps, train_loss, vali_loss, test_loss,
-                vali_acc, vali_auc, vali_recall, vali_F1,
-                test_acc, test_auc, test_recall, test_F1))
+            epoch_duration = time.time() - epoch_time
+            last_loss = loss.item()
+            self._print_stage(
+                '训练',
+                (
+                    f'第 {epoch + 1}/{self.args.train_epochs} 轮完成 | 已执行 batch: {completed_steps}/{train_steps} | '
+                    f'平均训练损失: {self._format_metric(train_loss)} | 最后一个 batch 损失: {self._format_metric(last_loss)} | '
+                    f'耗时: {epoch_duration:.2f}s'
+                )
+            )
+            if speed > 0:
+                self._print_stage('训练', f'最近估计速度: {speed:.4f}s/batch | 预计剩余: {left_time:.2f}s')
+            self._print_metric_block('验证', vali_loss, vali_acc, vali_auc, vali_recall, vali_F1)
+            self._print_metric_block('测试', test_loss, test_acc, test_auc, test_recall, test_F1)
+            self._manage_runtime_memory('epoch收尾', force_gc=getattr(self.args, 'xpu_force_gc', False))
 
-            best_model_file = "./SavedModels/train_loss{:.7f}vali_loss{:.7f}".format(train_loss, vali_loss)
+            best_model_file = os.path.join(
+                self.args.saved_models_dir,
+                f"train_loss{train_loss:.7f}vali_loss{vali_loss:.7f}.pt"
+            )
             early_stopping(vali_loss, self.model, best_model_file)
             if early_stopping.early_stop:
-                print("Early stopping")
+                self._print_stage('训练', '触发提前停止，结束后续轮次。')
                 break
 
             adjust_learning_rate(model_optim, epoch + 1, self.args)
 
-            # get_cka(self.args, setting, self.model, train_loader, self.device, epoch)
-
         self.best_model_file = early_stopping.get_best_model_file()
+        self._print_stage('训练', f'加载验证集表现最优的模型参数: {self.best_model_file}')
+        self._save_json(
+            os.path.join(record_dir, 'train_summary.json'),
+            {
+                'best_model_file': self.best_model_file,
+                'setting': setting,
+            },
+        )
 
-        self.model.load_state_dict(torch.load(self.best_model_file))
+        self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
 
         return self.model
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
-
-        self.print_debug = True  # 启用调试打印
+        self.print_debug = True
 
         if test:
-            print('loading model')
-            #             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
-            self.model.load_state_dict(torch.load(self.best_model_file))
-        #             self.model.load_state_dict(torch.load("./SavedModels/train_loss3.8585015vali_loss3.8551736"))
+            self._print_stage('测试', '按需加载最优模型参数进行测试。')
+            self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
 
         preds = []
-        preds_1 = []
-        trues_1 = []
-
         trues = []
+        raw_preds = []
+        raw_trues = []
 
-        if self.args.num_stock==77:
-            folder_path_1 = './Back_test_NA100/'
-        else:
-            folder_path_1 = './Back_test_CSI300/'
-
-
-
-
-        folder_path_1 = './Back_test_NA100/'
-        folder_path = './test_results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        folder_path = self._setting_dir(self.args.test_results_dir, setting)
 
         self.model.eval()
+        stage_name = '测试'
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark,) in enumerate(test_loader):
-                print(i)
+            for i, batch in enumerate(test_loader):
+                if self._debug_break(i):
+                    break
 
-                #                 condition = batch_y[:,:,-1] > 0
-                #                 batch_y[:,:,-1] = condition.to(torch.int64)
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
+                dec_inp = self._build_decoder_input(batch_y)
+                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+                batch_y = self._extract_target_labels(batch_y)
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                outputs_np = outputs.detach().cpu().numpy()
+                batch_y_np = batch_y.detach().cpu().numpy()
 
-                # 测试用，用完删
-                batch_x = batch_x.reshape(-1, batch_x.shape[2], batch_x.shape[3])
-                batch_y = batch_y.reshape(-1, batch_y.shape[2], batch_y.shape[3])
-                batch_x_mark = batch_x_mark.reshape(-1, batch_x_mark.shape[2], batch_x_mark.shape[3])
-                batch_y_mark = batch_y_mark.reshape(-1, batch_y_mark.shape[2], batch_y_mark.shape[3])
+                raw_preds.append(outputs_np)
+                raw_trues.append(batch_y_np)
+                preds.append(outputs_np.reshape(-1, 2))
+                trues.append(batch_y_np.reshape(-1))
 
-                #                 first_day_values = batch_y[:, :1, :]
-                #                 target_y = batch_y[:, :48, :]
-                #                 target_y -= first_day_values
-                #                 target_y = (target_y > 0).float()
-                #                 batch_y[:, :48, :] = target_y
+                if self._should_cleanup_after_batch(i):
+                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+        preds_tensor = torch.cat([torch.from_numpy(p) for p in preds], dim=0)
+        trues_tensor = torch.cat([torch.from_numpy(t) for t in trues], dim=0)
 
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        acc, auc, recall, f1 = calculate_metrics(preds_tensor, trues_tensor)
+        self._print_metric_block('测试结果', 0.0, acc, auc, recall, f1)
 
-                f_dim = -1 if self.args.features == 'MS' else 0
+        preds_file_path = os.path.join(folder_path, 'preds.pt')
+        trues_file_path = os.path.join(folder_path, 'trues.pt')
 
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-
-                first_day_values = batch_y[:, :1, :]
-
-                batch_y -= first_day_values
-
-                batch_y = (batch_y > 0).float()
-
-                outputs = outputs.detach().cpu().numpy()
-                batch_y = batch_y.detach().cpu().numpy()
-
-                preds_1.append(outputs)
-                trues_1.append(batch_y)
-
-                outputs = outputs.reshape(-1, 2)
-                batch_y_1 = batch_y.reshape(-1)
-
-                pred = outputs  # outputs.detach().cpu().numpy()  # .squeeze()
-                true = batch_y  # batch_y.detach().cpu().numpy()  # .squeeze()
-
-                preds.append(pred)
-                trues.append(batch_y_1)
-
-        #         preds = np.array(preds)
-        #         trues = np.array(trues)
-        preds_tensors = [torch.from_numpy(pred) for pred in preds]
-        trues_tensor = [torch.from_numpy(true) for true in trues]
-
-        #         print(preds_tensors[0].shape,trues_tensor[0].shape)
-
-        preds_tensor = torch.cat(preds_tensors, dim=0)
-        trues_tensor = torch.cat(trues_tensor, dim=0)
-
-        acc, auc, recall, f1 = calculate_metrics(preds_tensor, trues_tensor)  # ( 57, 5520, 2) ,#(57, 5520)
-
-        print(' acc:{}, auc:{}, recall:{}, f1:{}'.format(acc, auc, recall, f1))
-
-        preds_file_path = os.path.join(folder_path_1, f'preds_{self.args.model}_1.pt')
-        trues_file_path = os.path.join(folder_path_1, f'trues_{self.args.model}_1.pt')
-
-        torch.save(preds_1, preds_file_path)
-        torch.save(trues_1, trues_file_path)
-
-        return
+        torch.save(raw_preds, preds_file_path)
+        torch.save(raw_trues, trues_file_path)
+        self._save_json(
+            os.path.join(folder_path, 'metrics.json'),
+            {
+                'acc': float(acc),
+                'auc': float(auc),
+                'recall': float(recall),
+                'f1': float(f1),
+            },
+        )
+        self._print_stage('测试', f'预测 logits 已保存到: {preds_file_path}')
+        self._print_stage('测试', f'真实标签已保存到: {trues_file_path}')
+        self._manage_runtime_memory(stage_name, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
     def predict(self, setting, load=False):
         pred_data, pred_loader = self._get_data(flag='pred')
 
         if load:
-            print('loading model for prediction')
-            self.model.load_state_dict(torch.load(self.best_model_file))
+            self._print_stage('预测', '加载最优模型参数用于未来数据预测。')
+            self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
 
-        folder_path = './pred_results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        folder_path = self._setting_dir(self.args.pred_results_dir, setting)
 
         logits_all = []
         probs_all = []
 
         self.model.eval()
+        total_batches = len(pred_loader)
+        stage_name = '预测'
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
-                print(f'predict batch: {i}')
+            for i, batch in enumerate(pred_loader):
+                if self._debug_break(i):
+                    break
+                if i == 0 or (i + 1) == total_batches or (i + 1) % 10 == 0:
+                    self._print_stage('预测', f'正在处理第 {i + 1}/{total_batches} 个 batch')
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
-
-                batch_x = batch_x.reshape(-1, batch_x.shape[2], batch_x.shape[3])
-                batch_y = batch_y.reshape(-1, batch_y.shape[2], batch_y.shape[3])
-                batch_x_mark = batch_x_mark.reshape(-1, batch_x_mark.shape[2], batch_x_mark.shape[3])
-                batch_y_mark = batch_y_mark.reshape(-1, batch_y_mark.shape[2], batch_y_mark.shape[3])
-
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
+                dec_inp = self._build_decoder_input(batch_y)
+                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
 
                 probs = torch.softmax(outputs, dim=-1)
                 logits_all.append(outputs.detach().cpu())
                 probs_all.append(probs.detach().cpu())
+                if self._should_cleanup_after_batch(i):
+                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
         pred_logits_path = os.path.join(folder_path, 'pred_logits.pt')
         pred_probs_path = os.path.join(folder_path, 'pred_probs.pt')
         torch.save(logits_all, pred_logits_path)
         torch.save(probs_all, pred_probs_path)
 
-        print(f'Prediction results saved to {folder_path}')
-        return
+        if hasattr(pred_data, 'selected_codes') and hasattr(pred_data, 'future_dates'):
+            meta_rows = []
+            for trade_date in pred_data.future_dates:
+                for ts_code in pred_data.selected_codes:
+                    meta_rows.append({
+                        'ts_code': str(ts_code),
+                        'trade_date': pd.Timestamp(trade_date).strftime('%Y%m%d'),
+                    })
+            pd.DataFrame(meta_rows).to_csv(os.path.join(folder_path, 'prediction_index.csv'), index=False)
+
+        self._print_stage('预测', f'预测 logits 已保存到: {pred_logits_path}')
+        self._print_stage('预测', f'预测概率已保存到: {pred_probs_path}')
+        self._manage_runtime_memory(stage_name, force_gc=getattr(self.args, 'xpu_force_gc', False))
+
+    def export_prediction_factor(self, checkpoint_path, output_path, factor_column='factor'):
+        pred_data, pred_loader = self._get_data(flag='pred')
+        self.model.load_state_dict(load_checkpoint(checkpoint_path, self.device))
+        self.model.eval()
+
+        factor_frames = []
+        with torch.no_grad():
+            for batch in pred_loader:
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
+                dec_inp = self._build_decoder_input(batch_y)
+                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, '因子导出')
+
+                up_prob = torch.softmax(outputs, dim=-1)[:, :, 1].detach().cpu().numpy()
+                factor_df = pd.DataFrame(up_prob, index=pred_data.selected_codes)
+                factor_df.columns = [pd.Timestamp(item).strftime('%Y%m%d') for item in pred_data.future_dates]
+                factor_df.index.name = 'ts_code'
+                factor_df = factor_df.stack().reset_index()
+                factor_df.columns = ['ts_code', 'trade_date', factor_column]
+                factor_frames.append(factor_df)
+
+        result = pd.concat(factor_frames, ignore_index=True)
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        result.to_csv(output_path, index=False)
+        self._print_stage('因子导出', f'因子表已保存到: {output_path}')
+        return result

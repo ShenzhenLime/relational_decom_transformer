@@ -1,3 +1,0 @@
-模型逻辑：
-1、初始化模型参数和组件（输入输出维度、模型维度、层数、注意力机制、前馈网络、分解方法等）
-2、forward中，将x_enc分解为seasonal(x-trend后，保留快速傅里叶变换的高频波段，转为时域)、trend（Avgpool前后取平均）、residual_enc（x-trend-seasonal）

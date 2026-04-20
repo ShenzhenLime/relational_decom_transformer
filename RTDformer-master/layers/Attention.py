@@ -33,13 +33,22 @@ class FullAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
         self.T = T
 
-    def forward(self, queries, keys, values, attn_mask):
+    def forward(self, queries, keys, values, attn_mask, top_k=0):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
 
         scores = torch.einsum("blhe,bshe->bhls", queries, keys) * scale
 
+        # 稀疏Top-K注意力（仅用于ISCA，B=pred_len, L=num_stocks, H, E）
+        if top_k and top_k > 0 and scores.shape[-1] > top_k:
+            # scores: [B, H, L, L]，对最后一维（每个query的所有key）做TopK
+            topk_val, topk_idx = torch.topk(torch.abs(scores), top_k, dim=-1)
+            mask = torch.full_like(scores, float('-inf'))
+            mask.scatter_(-1, topk_idx, topk_val)
+            scores = mask
+
+        A = None
         if self.activation == 'softmax':
             if self.mask_flag:
                 if attn_mask is None:
@@ -87,6 +96,10 @@ class FourierAttention(nn.Module):
 
     def forward(self, q, k, v, mask):
         # size = [B, L, H, E]
+        # FFT 及复数运算不支持 float16，需要强制 float32（AMP 兼容）
+        orig_dtype = q.dtype
+        q, k, v = q.float(), k.float(), v.float()
+
         B, L, H, E = q.shape
         _, S, H, E = k.shape
         xq = q.permute(0, 2, 3, 1)  # size = [B, H, E, L]
@@ -136,7 +149,7 @@ class FourierAttention(nn.Module):
             xqk_ft = torch.complex(xqk_ft_real, torch.zeros_like(xqk_ft_real))
             xqkv_ft = torch.einsum("bhxy,bhey->bhex", xqk_ft, xv_ft_)
 
-        out = torch.fft.irfft(xqkv_ft, n=L, dim=-1, norm='ortho').permute(0, 3, 1, 2)
+        out = torch.fft.irfft(xqkv_ft, n=L, dim=-1, norm='ortho').permute(0, 3, 1, 2).to(orig_dtype)
 
         if self.output_attention == False:
             return (out, None)
@@ -205,7 +218,7 @@ class WaveletAttention(nn.Module):
         v = v.view(v.shape[0], v.shape[1], self.c, self.k)
 
         if N > S:
-            zeros = torch.zeros_like(q[:, :(N - S), :]).float()
+            zeros = torch.zeros_like(q[:, :(N - S), :])
             v = torch.cat([v, zeros], dim=1)
             k = torch.cat([k, zeros], dim=1)
         else:
@@ -238,7 +251,7 @@ class WaveletAttention(nn.Module):
                 attn_d = scores_d  # (B,H,q,k)
             elif self.activation == 'linear_norm':
                 attn_d = scores_d  # (B,H,q,k)
-                mins = attn_d.min(dim=-1).unsqueeze(-1).expand(-1, -1, -1, attn_d.shape[3])
+                mins = attn_d.min(dim=-1)[0].unsqueeze(-1).expand(-1, -1, -1, attn_d.shape[3])
                 attn_d -= mins
                 sums = attn_d.sum(dim=-1).unsqueeze(-1).expand(-1, -1, -1, attn_d.shape[3])
                 attn_d /= sums
@@ -253,7 +266,7 @@ class WaveletAttention(nn.Module):
                 attn_s = scores_s  # (B,H,q,k)
             elif self.activation == 'linear_norm':
                 attn_s = scores_s  # (B,H,q,k)
-                mins = attn_s.min(dim=-1).unsqueeze(-1).expand(-1, -1, -1, attn_s.shape[3])
+                mins = attn_s.min(dim=-1)[0].unsqueeze(-1).expand(-1, -1, -1, attn_s.shape[3])
                 attn_s -= mins
                 sums = attn_s.sum(dim=-1).unsqueeze(-1).expand(-1, -1, -1, attn_s.shape[3])
                 attn_s /= sums
@@ -286,7 +299,7 @@ class WaveletAttention(nn.Module):
         x_o = torch.matmul(x, self.rc_o)
 
         x = torch.zeros(B, N * 2, c, self.k,
-                        device=x.device)
+                        device=x.device, dtype=x.dtype)
         x[..., ::2, :, :] = x_e
         x[..., 1::2, :, :] = x_o
         return x

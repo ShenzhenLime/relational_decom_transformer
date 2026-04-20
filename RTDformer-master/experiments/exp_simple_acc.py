@@ -43,6 +43,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super().__init__(args)
         self.print_debug = False
+        if self.args.model == 'RTDformer2' and self.args.device_type == 'cuda' and self.args.use_amp:
+            self.args.use_amp = False
+            self._print_stage('设备', '检测到 RTDformer2 在 CUDA AMP 下存在数值不稳定，已自动关闭 AMP 以避免 NaN。')
+
+    @staticmethod
+    def _finite_ratio(tensor):
+        return torch.isfinite(tensor).float().mean().item()
 
     @staticmethod
     def _format_metric(value):
@@ -130,6 +137,20 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
         return torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
+    def _ensure_finite(self, name, tensor):
+        if torch.isfinite(tensor).all():
+            return
+
+        detached = tensor.detach().float()
+        finite_mask = torch.isfinite(detached)
+        finite_values = detached[finite_mask]
+        min_value = float(finite_values.min().item()) if finite_values.numel() else float('nan')
+        max_value = float(finite_values.max().item()) if finite_values.numel() else float('nan')
+        raise RuntimeError(
+            f'{name} 出现非有限值 | shape={tuple(detached.shape)} | '
+            f'finite_ratio={self._finite_ratio(detached):.6f} | min={min_value:.6f} | max={max_value:.6f}'
+        )
+
     def _forward(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name):
         """统一的模型前向传播，处理 AMP 和 output_attention"""
         from contextlib import nullcontext
@@ -137,7 +158,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             ctx = autocast_context(self.args) if self.args.use_amp else nullcontext()
             with ctx:
                 result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                return result[0] if self.args.output_attention else result
+                outputs = result[0] if self.args.output_attention else result
+            self._ensure_finite(f'{stage_name} 模型输出', outputs)
+            return outputs
         except torch.OutOfMemoryError as exc:
             self._handle_oom(stage_name, exc)
 
@@ -155,21 +178,31 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         batch_y = batch_y.float().to(self.device)
         batch_x_mark = batch_x_mark.float().to(self.device)
         batch_y_mark = batch_y_mark.float().to(self.device)
-        stock_mask = stock_mask.to(self.device).bool().reshape(-1)
-
-        batch_x = batch_x.reshape(-1, batch_x.shape[2], batch_x.shape[3])
-        batch_y = batch_y.reshape(-1, batch_y.shape[2], batch_y.shape[3])
-        batch_x_mark = batch_x_mark.reshape(-1, batch_x_mark.shape[2], batch_x_mark.shape[3])
-        batch_y_mark = batch_y_mark.reshape(-1, batch_y_mark.shape[2], batch_y_mark.shape[3])
+        stock_mask = stock_mask.to(self.device).bool()
 
         if not stock_mask.any():
             raise ValueError('当前 batch 没有任何满足窗口覆盖条件的股票。')
 
-        batch_x = batch_x[stock_mask]
-        batch_y = batch_y[stock_mask]
-        batch_x_mark = batch_x_mark[stock_mask]
-        batch_y_mark = batch_y_mark[stock_mask]
-        return batch_x, batch_y, batch_x_mark, batch_y_mark
+        return batch_x, batch_y, batch_x_mark, batch_y_mark, stock_mask
+
+    def _iter_window_batches(self, batch_x, batch_y, batch_x_mark, batch_y_mark, stock_mask):
+        empty_windows = []
+        for sample_index in range(batch_x.shape[0]):
+            valid_mask = stock_mask[sample_index].reshape(-1)
+            if not valid_mask.any():
+                empty_windows.append(sample_index)
+                continue
+            yield (
+                sample_index,
+                batch_x[sample_index][valid_mask],
+                batch_y[sample_index][valid_mask],
+                batch_x_mark[sample_index][valid_mask],
+                batch_y_mark[sample_index][valid_mask],
+            )
+
+        if empty_windows:
+            empty_windows_str = ', '.join(str(index) for index in empty_windows)
+            raise ValueError(f'当前 batch 中存在空股票窗口，样本索引: {empty_windows_str}')
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -183,17 +216,30 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self._debug_break(i):
                     break
 
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                dec_inp = self._build_decoder_input(batch_y)
-                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
+                prepared_batch = self._prepare_batch(batch)
+                batch_outputs = []
+                batch_targets = []
+                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                    dec_inp = self._build_decoder_input(sample_y)
+                    outputs = self._forward(
+                        sample_x,
+                        sample_x_mark,
+                        dec_inp,
+                        sample_y_mark,
+                        f'{stage_name} sample={sample_index}',
+                    )
+                    targets = self._extract_target_labels(sample_y, as_int=True).reshape(-1).to(torch.long)
+                    batch_outputs.append(outputs.reshape(-1, 2))
+                    batch_targets.append(targets)
 
-                batch_y = self._extract_target_labels(batch_y, as_int=True)
-                outputs = outputs.reshape(-1, 2)
-                batch_y = batch_y.reshape(-1).to(torch.long)
+                outputs = torch.cat(batch_outputs, dim=0)
+                batch_y = torch.cat(batch_targets, dim=0)
+                batch_loss = criterion(outputs, batch_y)
+                self._ensure_finite(f'{stage_name} loss', batch_loss)
 
                 preds.append(outputs.detach().cpu())
                 trues.append(batch_y.detach().cpu())
-                total_loss.append(criterion(outputs, batch_y).item())
+                total_loss.append(batch_loss.item())
 
                 if self._should_cleanup_after_batch(i):
                     self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
@@ -245,15 +291,26 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 iter_count += 1
                 model_optim.zero_grad()
 
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                dec_inp = self._build_decoder_input(batch_y)
-                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
+                prepared_batch = self._prepare_batch(batch)
+                batch_outputs = []
+                batch_targets = []
+                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                    dec_inp = self._build_decoder_input(sample_y)
+                    outputs = self._forward(
+                        sample_x,
+                        sample_x_mark,
+                        dec_inp,
+                        sample_y_mark,
+                        f'{stage_name} sample={sample_index}',
+                    )
+                    targets = self._extract_target_labels(sample_y, as_int=True).reshape(-1).to(torch.long)
+                    batch_outputs.append(outputs.reshape(-1, 2))
+                    batch_targets.append(targets)
 
-                batch_y = self._extract_target_labels(batch_y)
-                outputs = outputs.reshape(-1, 2)
-                batch_y = batch_y.reshape(-1).to(torch.long)
-
+                outputs = torch.cat(batch_outputs, dim=0)
+                batch_y = torch.cat(batch_targets, dim=0)
                 loss = criterion(outputs, batch_y)
+                self._ensure_finite(f'{stage_name} loss', loss)
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
@@ -277,7 +334,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
             test_loss, test_acc, test_auc, test_recall, test_F1 = self.vali(test_data, test_loader, criterion)
-
             epoch_duration = time.time() - epoch_time
             last_loss = loss.item()
             self._print_stage(
@@ -306,6 +362,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             adjust_learning_rate(model_optim, epoch + 1, self.args)
 
         self.best_model_file = early_stopping.get_best_model_file()
+        if self.best_model_file is None:
+            raise RuntimeError('训练过程中没有得到任何有限的验证集损失，无法加载最优模型。')
         self._print_stage('训练', f'加载验证集表现最优的模型参数: {self.best_model_file}')
         self._save_json(
             os.path.join(record_dir, 'train_summary.json'),
@@ -341,19 +399,26 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self._debug_break(i):
                     break
 
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                dec_inp = self._build_decoder_input(batch_y)
-                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
+                prepared_batch = self._prepare_batch(batch)
+                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                    dec_inp = self._build_decoder_input(sample_y)
+                    outputs = self._forward(
+                        sample_x,
+                        sample_x_mark,
+                        dec_inp,
+                        sample_y_mark,
+                        f'{stage_name} sample={sample_index}',
+                    )
 
-                batch_y = self._extract_target_labels(batch_y)
+                    targets = self._extract_target_labels(sample_y)
 
-                outputs_np = outputs.detach().cpu().numpy()
-                batch_y_np = batch_y.detach().cpu().numpy()
+                    outputs_np = outputs.detach().cpu().numpy()
+                    batch_y_np = targets.detach().cpu().numpy()
 
-                raw_preds.append(outputs_np)
-                raw_trues.append(batch_y_np)
-                preds.append(outputs_np.reshape(-1, 2))
-                trues.append(batch_y_np.reshape(-1))
+                    raw_preds.append(outputs_np)
+                    raw_trues.append(batch_y_np)
+                    preds.append(outputs_np.reshape(-1, 2))
+                    trues.append(batch_y_np.reshape(-1))
 
                 if self._should_cleanup_after_batch(i):
                     self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
@@ -404,13 +469,20 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if i == 0 or (i + 1) == total_batches or (i + 1) % 10 == 0:
                     self._print_stage('预测', f'正在处理第 {i + 1}/{total_batches} 个 batch')
 
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                dec_inp = self._build_decoder_input(batch_y)
-                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name)
+                prepared_batch = self._prepare_batch(batch)
+                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                    dec_inp = self._build_decoder_input(sample_y)
+                    outputs = self._forward(
+                        sample_x,
+                        sample_x_mark,
+                        dec_inp,
+                        sample_y_mark,
+                        f'{stage_name} sample={sample_index}',
+                    )
 
-                probs = torch.softmax(outputs, dim=-1)
-                logits_all.append(outputs.detach().cpu())
-                probs_all.append(probs.detach().cpu())
+                    probs = torch.softmax(outputs, dim=-1)
+                    logits_all.append(outputs.detach().cpu())
+                    probs_all.append(probs.detach().cpu())
                 if self._should_cleanup_after_batch(i):
                     self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
 

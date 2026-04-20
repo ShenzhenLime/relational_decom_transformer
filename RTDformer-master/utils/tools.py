@@ -28,8 +28,16 @@ class EarlyStopping:
         self.early_stop = False
         self.val_loss_min = np.inf
         self.delta = delta
+        self.best_model_file = None
 
     def __call__(self, val_loss, model, path):
+        if not np.isfinite(val_loss):
+            self.counter += 1
+            print(f'[训练] 验证集损失为非有限值: {val_loss}，跳过保存。提前停止计数: {self.counter}/{self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return
+
         score = -val_loss
         if self.best_score is None:
             self.best_score = score

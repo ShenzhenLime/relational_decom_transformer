@@ -61,7 +61,6 @@ RTDformer-master/
 - data_provider/data_match.py：负责 DataLoader 和 batch padding
 - experiments/exp_simple_acc.py：负责训练、验证、测试、预测循环
 - utils/device_utils.py：负责 CPU、CUDA、XPU 设备管理、AMP、缓存清理、OOM 诊断
-- data/data.db：历史遗留文件，当前主流程不依赖它
 
 ## 3. 数据从哪里来
 

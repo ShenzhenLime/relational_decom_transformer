@@ -1,4 +1,4 @@
 {
-  "best_model_file": "C:\\file\\量化\\quant\\deep_learning\\RTDformer-master\\results\\saved_models\\train_loss0.6997830vali_loss0.7212422.pt",
+  "best_model_file": "C:\\file\\量化\\quant\\deep_learning\\RTDformer-master\\results\\saved_models\\train_loss0.6964407vali_loss0.6904530.pt",
   "setting": "test_RTDformer2_StockDataset_MS_ft96_sl48_ll48_pl128_dm4_nh1_el1_dl512_df1_fctimeF_ebTrue_dttest_projection_0"
 }

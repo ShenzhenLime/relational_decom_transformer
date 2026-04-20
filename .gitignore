@@ -4,3 +4,4 @@ RTDformer-master/paper
 RTDformer-master/deploy
 *.pt
 *.zip
+__pycache__/

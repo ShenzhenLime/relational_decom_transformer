@@ -32,6 +32,7 @@ class Model(nn.Module):
         self.output_attention = configs.output_attention
         self.output_stl = configs.output_stl
         self.device = torch.device(getattr(configs, 'device', 'cpu'))
+        self.top_k = getattr(configs, 'top_k', 0)
 
         # Decomp
         kernel_size = configs.moving_avg
@@ -100,11 +101,12 @@ class Model(nn.Module):
         self.seasonal_encoder = Encoder(
             [
                 EncoderLayer(
-                    AttentionLayer(enc_self_attention, configs.d_model),
+                    AttentionLayer(enc_self_attention, configs.d_model, configs.n_heads),
                     configs.d_model,
+                    configs.d_ff,
                     dropout=configs.dropout,
                     activation=configs.activation
-                ) for l in range(2)   ## 生成两个层
+                ) for l in range(configs.e_layers)   ## 生成多个层
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
@@ -113,13 +115,14 @@ class Model(nn.Module):
         self.seasonal_decoder = Decoder(
             [
                 DecoderLayer(
-                    AttentionLayer(dec_self_attention, configs.d_model),
-                    AttentionLayer(dec_cross_attention, configs.d_model),
+                    AttentionLayer(dec_self_attention, configs.d_model, configs.n_heads),
+                    AttentionLayer(dec_cross_attention, configs.d_model, configs.n_heads),
                     configs.d_model,
+                    configs.d_ff,
                     dropout=configs.dropout,
                     activation=configs.activation,
                 )
-                for l in range(1)
+                for l in range(configs.d_layers)
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model),
             projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
@@ -141,12 +144,12 @@ class Model(nn.Module):
         
         
         self.trend_encoder = Encoder(
-            [EncoderLayer(AttentionLayer(enc_self_attention_trend, configs.d_model), configs.d_model, dropout=configs.dropout, activation=configs.activation) for l in range(2)],
+            [EncoderLayer(AttentionLayer(enc_self_attention_trend, configs.d_model, configs.n_heads), configs.d_model, configs.d_ff, dropout=configs.dropout, activation=configs.activation) for l in range(configs.e_layers)],
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
 
         self.trend_decoder = Decoder(
-            [DecoderLayer(AttentionLayer(dec_self_attention_trend, configs.d_model), AttentionLayer(dec_cross_attention_trend, configs.d_model), configs.d_model, dropout=configs.dropout, activation=configs.activation) for l in range(1)],
+            [DecoderLayer(AttentionLayer(dec_self_attention_trend, configs.d_model, configs.n_heads), AttentionLayer(dec_cross_attention_trend, configs.d_model, configs.n_heads), configs.d_model, configs.d_ff, dropout=configs.dropout, activation=configs.activation) for l in range(configs.d_layers)],
             norm_layer=torch.nn.LayerNorm(configs.d_model),
             projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
         )
@@ -253,7 +256,7 @@ class Model(nn.Module):
         dec_out = dec_out.permute(1, 0, 2)
         B, L, D = dec_out.shape
         dec_out = dec_out.unsqueeze(2)
-        dec_out, _ = self.full_attention(dec_out, dec_out, dec_out, attn_mask=None)
+        dec_out, _ = self.full_attention(dec_out, dec_out, dec_out, attn_mask=None, top_k=self.top_k)
         
         dec_out = dec_out.squeeze(2) 
         

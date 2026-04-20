@@ -14,7 +14,7 @@ class AttentionLayer(nn.Module):
     """
     完成子层1：多头注意力机制（Multi-Head Attention），结果为MultiHead(Q, K, V )
     """
-    def __init__(self, attention, d_model, n_heads=8, d_keys=None,
+    def __init__(self, attention, d_model, n_heads, d_keys=None,
                  d_values=None):
         super(AttentionLayer, self).__init__()
 
@@ -73,7 +73,7 @@ class ConvLayer(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, attention, d_model, d_ff=2048, dropout=0.1, activation="relu"):
+    def __init__(self, attention, d_model, d_ff, dropout=0.1, activation="relu"):
         super(EncoderLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.attention = attention
@@ -156,7 +156,7 @@ class Encoder(nn.Module):
 #         return x, attns
 
 class DecoderLayer(nn.Module):
-    def __init__(self, self_attention, cross_attention, d_model, d_ff=2048,
+    def __init__(self, self_attention, cross_attention, d_model, d_ff,
                  dropout=0.1, activation="relu"):
         super(DecoderLayer, self).__init__()
         d_ff = d_ff or 4 * d_model

@@ -45,6 +45,7 @@ data_group.add_argument('--prediction_date', type=str, default='', help='single 
 data_group.add_argument('--seq_len', type=int, default=48, help='input sequence length')
 data_group.add_argument('--label_len', type=int, default=24, help='decoder warmup length')
 data_group.add_argument('--pred_len', type=int, default=24, help='prediction horizon')
+data_group.add_argument('--factor_day', type=int, default=-1, help='1-based forecast day used as factor; use -1 for the last day in pred_len')
 data_group.add_argument('--dynamic_stock_cap', type=int, default=10, help='cap stocks per dynamic window')
 
 model_group = parser.add_argument_group('model')
@@ -131,20 +132,10 @@ def resolve_runtime_paths(args, run_dir=None):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     args.run_dir = str(run_path)
-    args.run_name = run_path.name
     args.checkpoint_dir = str(checkpoint_dir)
     args.args_json_path = str(run_path / 'args.json')
     args.output_json_path = str(run_path / 'output.json')
     args.factor_output_path = str(run_path / FACTOR_OUTPUT_PATH)
-
-    args.checkpoints_dir = str(checkpoint_dir)
-    args.saved_models_dir = str(checkpoint_dir)
-    args.test_results_dir = str(run_path)
-    args.pred_results_dir = str(run_path)
-    args.factor_results_dir = str(run_path)
-    args.run_records_dir = str(run_path)
-
-    args.checkpoints = args.checkpoints_dir
     return args
 
 
@@ -156,6 +147,24 @@ def resolve_project_path(raw_path):
     if candidate.is_absolute():
         return str(candidate)
     return str((PROJECT_ROOT / candidate).resolve())
+
+
+def resolve_factor_step_index(args):
+    factor_day = int(args.factor_day)
+    if factor_day == -1:
+        step_index = args.pred_len - 1
+    else:
+        if factor_day < 1 or factor_day > args.pred_len:
+            raise ValueError(
+                f'--factor_day 必须在 [1, {args.pred_len}] 之间，或使用 -1 表示最后一天；当前为 {factor_day}。'
+            )
+        step_index = factor_day - 1
+
+    args.factor_step_index = step_index
+    return args
+
+
+args = resolve_factor_step_index(args)
 
 
 
@@ -212,7 +221,7 @@ if __name__ == '__main__':
             exp.train(setting)
             exp.test(setting)
             if args.save:
-                exp.export_valid_test_factors()
+                exp.export_valid_test_factors(step_index=args.factor_step_index)
             empty_cache(args.device_type)
         elif args.run == 'test':
             if not args.checkpoint_path:
@@ -235,6 +244,7 @@ if __name__ == '__main__':
             exp.predict_factor_by_date(
                 prediction_date=args.prediction_date,
                 checkpoint_path=args.checkpoint_path,
+                step_index=args.factor_step_index,
             )
             empty_cache(args.device_type)
         else:

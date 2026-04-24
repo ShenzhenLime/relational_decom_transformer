@@ -156,9 +156,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             return probabilities[:, step_index, 1]
         raise ValueError(f'不支持的因子输出维度: {tuple(probabilities.shape)}')
 
-    def _resolve_split_trade_date(self, dataset, window_index, step_index=0):
+    def _get_trade_date(self, dataset, window_index):
         window_start = int(dataset.sample_window_starts[window_index])
-        target_position = window_start + self.args.seq_len + step_index
+        target_position = window_start + self.args.seq_len - 1
         if target_position >= len(dataset.selected_dates):
             raise IndexError(
                 f'{window_index=} 对应的目标日期越界: target_position={target_position}, '
@@ -175,7 +175,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             for window_index, batch in enumerate(data_loader):
                 prepared_batch = self._prepare_batch(batch)
                 sample_scores = []
-
+                
+                ## 每天的5000只股票分chunk处理
                 for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
                     if sample_index != 0:
                         raise ValueError('因子导出要求单窗口 batch_size=1。')
@@ -194,10 +195,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         sample_scores.append(
                             self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
                         )
-
+                ## 合并
                 factor_scores = np.concatenate(sample_scores)
                 code_indices = dataset.sample_code_indices[window_index]
-                trade_date = self._resolve_split_trade_date(dataset, window_index, step_index=step_index)
+                trade_date = self._get_trade_date(dataset, window_index)
                 factor_frames.append(
                     pd.DataFrame(
                         {
@@ -215,7 +216,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return pd.concat(factor_frames, ignore_index=True)
 
-    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor', step_index=0):
+    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor'):
         factor_frames = []
 
         self.model.eval()
@@ -240,14 +241,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             f'pred 因子计算 chunk={chunk_index}',
                         )
                         sample_scores.append(
-                            self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
+                            self._extract_factor_scores(outputs).detach().cpu().numpy()
                         )
 
                 factor_frames.append(
                     pd.DataFrame(
                         {
                             'ts_code': pred_data.selected_codes,
-                            'trade_date': pd.Timestamp(pred_data.future_dates[step_index]).strftime('%Y%m%d'),
+                            'trade_date': pd.Timestamp(pred_data.target_date).strftime('%Y%m%d'),
                             factor_column: np.concatenate(sample_scores),
                         }
                     )
@@ -679,7 +680,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
         return metrics
 
-    def export_valid_test_factors(self, factor_column='factor', step_index=0):
+    def export_valid_test_factors(self, step_index=0, factor_column='factor'):
         result_frames = []
 
         for flag, dataset_split in (('val', 'valid'), ('test', 'test')):
@@ -742,7 +743,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             pred_data,
             pred_loader,
             factor_column=factor_column,
-            step_index=step_index,
         )
         if result.empty:
             raise RuntimeError(f'prediction_date={prediction_date} 未生成任何因子值。')

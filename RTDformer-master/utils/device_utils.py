@@ -159,42 +159,7 @@ def resolve_device_config(args):
 
     if getattr(args, 'use_amp', False) and device_type != 'cuda':
         args.use_amp = False
-        print(f'[设备] 当前设备类型为 {device_type}，已自动关闭 AMP。')
-
-    if device_type == 'xpu' and getattr(args, 'xpu_debug_mode', True):
-        debug_epochs = max(1, int(getattr(args, 'xpu_debug_epochs', 1)))
-        debug_batch_size = max(1, int(getattr(args, 'xpu_debug_batch_size', 1)))
-        debug_d_model = max(8, int(getattr(args, 'xpu_debug_d_model', 128)))
-        debug_d_ff = max(debug_d_model, int(getattr(args, 'xpu_debug_d_ff', 512)))
-        debug_n_heads = max(1, int(getattr(args, 'xpu_debug_n_heads', 4)))
-        debug_e_layers = max(1, int(getattr(args, 'xpu_debug_e_layers', 1)))
-
-        while debug_d_model % debug_n_heads != 0 and debug_n_heads > 1:
-            debug_n_heads -= 1
-
-        if getattr(args, 'train_epochs', debug_epochs) > debug_epochs:
-            print(f'[设备] XPU 调试模式生效: train_epochs {args.train_epochs} -> {debug_epochs}')
-            args.train_epochs = debug_epochs
-        if getattr(args, 'batch_size', debug_batch_size) > debug_batch_size:
-            print(f'[设备] XPU 调试模式生效: batch_size {args.batch_size} -> {debug_batch_size}')
-            args.batch_size = debug_batch_size
-        if getattr(args, 'd_model', debug_d_model) > debug_d_model:
-            print(f'[设备] XPU 调试模式生效: d_model {args.d_model} -> {debug_d_model}')
-            args.d_model = debug_d_model
-        if getattr(args, 'd_ff', debug_d_ff) > debug_d_ff:
-            print(f'[设备] XPU 调试模式生效: d_ff {args.d_ff} -> {debug_d_ff}')
-            args.d_ff = debug_d_ff
-        if getattr(args, 'n_heads', debug_n_heads) > debug_n_heads:
-            print(f'[设备] XPU 调试模式生效: n_heads {args.n_heads} -> {debug_n_heads}')
-            args.n_heads = debug_n_heads
-        if getattr(args, 'e_layers', debug_e_layers) > debug_e_layers:
-            print(f'[设备] XPU 调试模式生效: e_layers {args.e_layers} -> {debug_e_layers}')
-            args.e_layers = debug_e_layers
-        if getattr(args, 'patience', 1) > 1:
-            args.patience = 1
-        if getattr(args, 'num_workers', 0) != 0:
-            print(f'[设备] XPU 调试模式生效: num_workers {args.num_workers} -> 0')
-            args.num_workers = 0
+        # print(f'[设备] 当前设备类型为 {device_type}，已自动关闭 AMP。')
 
     return args
 

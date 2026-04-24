@@ -58,4 +58,10 @@ def export_full_stock_data_to_pt(output_path):
 
 if __name__ == '__main__':
     output_path = resolve_project_path(DATA_PATH)
+
+    ## 更新数据
+    from quant_infra.get_data import get_stock_data_by_date
+    get_stock_data_by_date()
+    
+    ## 导出全量数据到 .pt 文件
     export_full_stock_data_to_pt(output_path)

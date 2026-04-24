@@ -1,24 +1,28 @@
-from data_provider.data_match import data_provider
+import sys
+from pathlib import Path
+
+from data_provider.data_match import data_provider, dynamic_stock_collate
 
 from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate
 import torch
 import torch.nn as nn
 from torch import optim
+from torch.utils.data import DataLoader
 import os
 import json
 import time
 import warnings
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+from const import FACTOR_TABLE_NAME
 from utils.device_utils import (
     autocast_context,
     create_grad_scaler,
     device_memory_snapshot,
-    format_memory_snapshot,
     load_checkpoint,
     manage_device_memory,
-    oom_diagnostics_message,
 )
 
 warnings.filterwarnings('ignore')
@@ -71,24 +75,221 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             )
         )
 
-    def _ensure_dir(self, folder_path):
-        os.makedirs(folder_path, exist_ok=True)
-        return folder_path
-
-    def _setting_dir(self, base_dir, setting):
-        return self._ensure_dir(os.path.join(base_dir, setting))
+    def _to_jsonable(self, value):
+        if isinstance(value, dict):
+            return {key: self._to_jsonable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._to_jsonable(item) for item in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, Path):
+            return str(value)
+        return value
 
     def _save_json(self, file_path, payload):
         parent_dir = os.path.dirname(file_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
         with open(file_path, 'w', encoding='utf-8') as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(self._to_jsonable(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _append_output(self, event, payload):
+        output_path = getattr(self.args, 'output_json_path', '')
+        if not output_path:
+            return
+
+        entries = []
+        if os.path.exists(output_path):
+            with open(output_path, 'r', encoding='utf-8') as handle:
+                content = handle.read().strip()
+            if content:
+                entries = json.loads(content)
+                if not isinstance(entries, list):
+                    entries = [entries]
+
+        entries.append(
+            {
+                'event': event,
+                'logged_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                **self._to_jsonable(payload),
+            }
+        )
+        self._save_json(output_path, entries)
 
     def _save_run_config(self, setting):
-        record_dir = self._setting_dir(self.args.run_records_dir, setting)
-        self._save_json(os.path.join(record_dir, 'args.json'), vars(self.args))
-        return record_dir
+        self._save_json(
+            self.args.args_json_path,
+            {
+                **vars(self.args),
+                'setting': setting,
+            },
+        )
+        self._append_output(
+            'run_initialized',
+            {
+                'setting': setting,
+                'run_dir': self.args.run_dir,
+                'checkpoint_dir': self.args.checkpoint_dir,
+            },
+        )
+        return self.args.run_dir
+
+    def _get_factor_export_data(self, flag):
+        data_set, _ = self._get_data(flag=flag)
+        data_loader = DataLoader(
+            data_set,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+            collate_fn=dynamic_stock_collate,
+        )
+        return data_set, data_loader
+
+    def _extract_factor_scores(self, outputs, step_index=0):
+        probabilities = torch.softmax(outputs, dim=-1)
+        if probabilities.ndim == 2:
+            return probabilities[:, 1]
+        if probabilities.ndim == 3:
+            return probabilities[:, step_index, 1]
+        raise ValueError(f'不支持的因子输出维度: {tuple(probabilities.shape)}')
+
+    def _resolve_split_trade_date(self, dataset, window_index, step_index=0):
+        window_start = int(dataset.sample_window_starts[window_index])
+        target_position = window_start + self.args.seq_len + step_index
+        if target_position >= len(dataset.selected_dates):
+            raise IndexError(
+                f'{window_index=} 对应的目标日期越界: target_position={target_position}, '
+                f'len(selected_dates)={len(dataset.selected_dates)}'
+            )
+        return pd.Timestamp(dataset.selected_dates[target_position]).strftime('%Y%m%d')
+
+    def _collect_split_factor_frame(self, dataset, data_loader, dataset_split, factor_column='factor', step_index=0):
+        factor_frames = []
+        all_codes = np.asarray(dataset.all_codes)
+
+        self.model.eval()
+        with torch.no_grad():
+            for window_index, batch in enumerate(data_loader):
+                prepared_batch = self._prepare_batch(batch)
+                sample_scores = []
+
+                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                    if sample_index != 0:
+                        raise ValueError('因子导出要求单窗口 batch_size=1。')
+
+                    for chunk_index, (chunk_x, chunk_y, chunk_x_mark, chunk_y_mark) in enumerate(
+                        self._iter_stock_micro_batches(sample_x, sample_y, sample_x_mark, sample_y_mark)
+                    ):
+                        dec_inp = self._build_decoder_input(chunk_y)
+                        outputs = self._forward(
+                            chunk_x,
+                            chunk_x_mark,
+                            dec_inp,
+                            chunk_y_mark,
+                            f'{dataset_split} 因子导出 window={window_index} chunk={chunk_index}',
+                        )
+                        sample_scores.append(
+                            self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
+                        )
+
+                factor_scores = np.concatenate(sample_scores)
+                code_indices = dataset.sample_code_indices[window_index]
+                trade_date = self._resolve_split_trade_date(dataset, window_index, step_index=step_index)
+                factor_frames.append(
+                    pd.DataFrame(
+                        {
+                            'ts_code': all_codes[code_indices],
+                            'trade_date': trade_date,
+                            factor_column: factor_scores,
+                            'dataset_split': dataset_split,
+                            'window_index': window_index,
+                        }
+                    )
+                )
+
+        if not factor_frames:
+            return pd.DataFrame(columns=['ts_code', 'trade_date', factor_column, 'dataset_split', 'window_index'])
+
+        return pd.concat(factor_frames, ignore_index=True)
+
+    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor', step_index=0):
+        factor_frames = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in pred_loader:
+                prepared_batch = self._prepare_batch(batch)
+                sample_scores = []
+
+                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                    if sample_index != 0:
+                        raise ValueError('pred 模式要求单窗口 batch_size=1。')
+
+                    for chunk_index, (chunk_x, chunk_y, chunk_x_mark, chunk_y_mark) in enumerate(
+                        self._iter_stock_micro_batches(sample_x, sample_y, sample_x_mark, sample_y_mark)
+                    ):
+                        dec_inp = self._build_decoder_input(chunk_y)
+                        outputs = self._forward(
+                            chunk_x,
+                            chunk_x_mark,
+                            dec_inp,
+                            chunk_y_mark,
+                            f'pred 因子计算 chunk={chunk_index}',
+                        )
+                        sample_scores.append(
+                            self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
+                        )
+
+                factor_frames.append(
+                    pd.DataFrame(
+                        {
+                            'ts_code': pred_data.selected_codes,
+                            'trade_date': pd.Timestamp(pred_data.future_dates[step_index]).strftime('%Y%m%d'),
+                            factor_column: np.concatenate(sample_scores),
+                        }
+                    )
+                )
+
+        if not factor_frames:
+            return pd.DataFrame(columns=['ts_code', 'trade_date', factor_column])
+
+        return pd.concat(factor_frames, ignore_index=True)
+
+    @staticmethod
+    def _ensure_repo_src():
+        repo_src = Path(__file__).resolve().parents[3] / 'src'
+        if repo_src.exists() and str(repo_src) not in sys.path:
+            sys.path.insert(0, str(repo_src))
+
+    def _append_factor_to_db_if_missing(self, factor_df, table_name=FACTOR_TABLE_NAME):
+        self._ensure_repo_src()
+        from quant_infra import db_utils
+
+        trade_date = str(factor_df['trade_date'].iloc[0])
+        conn = db_utils.init_db()
+        try:
+            table_exists = conn.execute(
+                f"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{table_name}'"
+            ).fetchone()[0] > 0
+            already_exists = False
+            if table_exists:
+                already_exists = conn.execute(
+                    f"SELECT COUNT(*) FROM {table_name} WHERE trade_date = ?",
+                    [trade_date],
+                ).fetchone()[0] > 0
+        finally:
+            conn.close()
+
+        if already_exists:
+            self._print_stage('预测', f'{trade_date} 已存在于 {table_name}，跳过追加写入。')
+            return False
+
+        db_utils.write_to_db(factor_df[['ts_code', 'trade_date', 'factor']], table_name, save_mode='append')
+        self._print_stage('预测', f'{trade_date} 已追加到因子表 {table_name}。')
+        return True
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -99,38 +300,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def _get_data(self, flag):
         return data_provider(self.args, flag, print_debug=self.print_debug)
 
-    def _select_optimizer(self):
-        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-
-    def _select_criterion(self):
-        return nn.NLLLoss()
-
-    def _debug_max_batches(self):
-        if self.args.device_type == 'xpu' and getattr(self.args, 'xpu_debug_mode', False):
-            return max(1, int(getattr(self.args, 'xpu_debug_max_batches', 2)))
-        return None
-
-    def _debug_break(self, batch_index):
-        max_batches = self._debug_max_batches()
-        return max_batches is not None and batch_index >= max_batches
-
     def _should_cleanup_after_batch(self, batch_index):
         if self.args.device_type != 'xpu':
             return False
         interval = max(0, int(getattr(self.args, 'xpu_memory_cleanup_interval', 0)))
         return interval > 0 and (batch_index + 1) % interval == 0
-
-    def _manage_runtime_memory(self, stage, batch_index=None, force_gc=False, reset_peak=False):
-        manage_device_memory(self.args.device_type, force_gc=force_gc, reset_peak=reset_peak)
-        if self.args.device_type != 'xpu':
-            return
-        if getattr(self.args, 'xpu_log_memory', False):
-            prefix = stage if batch_index is None else f'{stage} batch={batch_index + 1}'
-            self._print_stage('内存', f'{prefix} | {format_memory_snapshot(device_memory_snapshot(self.args.device_type))}')
-
-    def _handle_oom(self, stage, exc):
-        self._manage_runtime_memory(stage, force_gc=True)
-        raise RuntimeError(oom_diagnostics_message(self.args.device_type, stage, exc)) from exc
 
     def _build_decoder_input(self, batch_y):
         """构造 decoder 输入：已知标签部分 + 零填充预测部分"""
@@ -161,8 +335,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 outputs = result[0] if self.args.output_attention else result
             self._ensure_finite(f'{stage_name} 模型输出', outputs)
             return outputs
-        except torch.OutOfMemoryError as exc:
-            self._handle_oom(stage_name, exc)
+        except torch.OutOfMemoryError:
+            manage_device_memory(self.args.device_type, force_gc=True)
+            raise
 
     def _extract_target_labels(self, batch_y, as_int=False):
         """从 batch_y 中提取目标标签：取预测区间、相对首日涨跌二分类"""
@@ -204,6 +379,23 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             empty_windows_str = ', '.join(str(index) for index in empty_windows)
             raise ValueError(f'当前 batch 中存在空股票窗口，样本索引: {empty_windows_str}')
 
+    def _iter_stock_micro_batches(self, sample_x, sample_y, sample_x_mark, sample_y_mark, chunk_size=None):
+        num_stocks = sample_x.shape[0]
+        if num_stocks == 0:
+            return
+
+        if chunk_size is None:
+            chunk_size = self.args.dynamic_stock_cap
+
+        for start in range(0, num_stocks, chunk_size):
+            end = min(start + chunk_size, num_stocks)
+            yield (
+                sample_x[start:end],
+                sample_y[start:end],
+                sample_x_mark[start:end],
+                sample_y_mark[start:end],
+            )
+
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
@@ -213,24 +405,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
-                if self._debug_break(i):
-                    break
-
                 prepared_batch = self._prepare_batch(batch)
                 batch_outputs = []
                 batch_targets = []
                 for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
-                    dec_inp = self._build_decoder_input(sample_y)
-                    outputs = self._forward(
-                        sample_x,
-                        sample_x_mark,
-                        dec_inp,
-                        sample_y_mark,
-                        f'{stage_name} sample={sample_index}',
-                    )
-                    targets = self._extract_target_labels(sample_y, as_int=True).reshape(-1).to(torch.long)
-                    batch_outputs.append(outputs.reshape(-1, 2))
-                    batch_targets.append(targets)
+                    sample_chunk_outputs = []
+                    sample_chunk_targets = []
+                    for chunk_index, (chunk_x, chunk_y, chunk_x_mark, chunk_y_mark) in enumerate(
+                        self._iter_stock_micro_batches(sample_x, sample_y, sample_x_mark, sample_y_mark)
+                    ):
+                        dec_inp = self._build_decoder_input(chunk_y)
+                        outputs = self._forward(
+                            chunk_x,
+                            chunk_x_mark,
+                            dec_inp,
+                            chunk_y_mark,
+                            f'{stage_name} sample={sample_index} chunk={chunk_index}',
+                        )
+                        targets = self._extract_target_labels(chunk_y, as_int=True).reshape(-1).to(torch.long)
+                        sample_chunk_outputs.append(outputs.reshape(-1, 2))
+                        sample_chunk_targets.append(targets)
+
+                    batch_outputs.append(torch.cat(sample_chunk_outputs, dim=0))
+                    batch_targets.append(torch.cat(sample_chunk_targets, dim=0))
 
                 outputs = torch.cat(batch_outputs, dim=0)
                 batch_y = torch.cat(batch_targets, dim=0)
@@ -242,12 +439,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 total_loss.append(batch_loss.item())
 
                 if self._should_cleanup_after_batch(i):
-                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
+                    manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
         acc, auc, recall, f1 = calculate_metrics(torch.cat(preds, dim=0), torch.cat(trues, dim=0))
         total_loss = np.average(total_loss)
         self.model.train()
-        self._manage_runtime_memory(stage_name, force_gc=getattr(self.args, 'xpu_force_gc', False))
+        manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
         return total_loss, acc, auc, recall, f1
 
@@ -256,39 +453,36 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
 
-        self._print_stage('训练', f'开始训练，实验标识: {setting}')
-        record_dir = self._save_run_config(setting)
+        self._print_stage('训练', '开始训练')
+        self._save_run_config(setting)
 
-        path = os.path.join(self.args.checkpoints, setting)
-        self._ensure_dir(path)
+        path = self.args.checkpoint_dir
+        os.makedirs(path, exist_ok=True)
+        temp_checkpoint_path = os.path.join(path, 'temp_epoch_end.pt')
 
-        time_now = time.time()
-
-        train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
-        model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        criterion = nn.NLLLoss()
 
         if self.args.use_amp:
             scaler = create_grad_scaler(self.args)
 
-        self._manage_runtime_memory('训练初始化', force_gc=True, reset_peak=True)
+        manage_device_memory(self.args.device_type, force_gc=True, reset_peak=True)
 
         for epoch in range(self.args.train_epochs):
-            iter_count = 0
             train_loss = []
             self.model.train()
             epoch_time = time.time()
-            speed = 0.0
-            left_time = 0.0
             stage_name = f'训练 epoch={epoch + 1}'
 
-            for i, batch in enumerate(train_loader):
-                if self._debug_break(i):
-                    break
-
-                iter_count += 1
+            batch_pbar = tqdm(
+                train_loader,
+                desc=f'Epoch [{epoch + 1}/{self.args.train_epochs}]',
+                dynamic_ncols=True,
+                mininterval=60, # 60s
+            )
+            for i, batch in enumerate(batch_pbar):
                 model_optim.zero_grad()
 
                 prepared_batch = self._prepare_batch(batch)
@@ -313,12 +507,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 self._ensure_finite(f'{stage_name} loss', loss)
                 train_loss.append(loss.item())
 
-                if (i + 1) % 100 == 0:
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    iter_count = 0
-                    time_now = time.time()
-
                 if self.args.use_amp:
                     scaler.scale(loss).backward()
                     scaler.step(model_optim)
@@ -327,46 +515,92 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     loss.backward()
                     model_optim.step()
                 if self._should_cleanup_after_batch(i):
-                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
+                    manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
-            completed_steps = len(train_loss)
+                mem = device_memory_snapshot(self.args.device_type)
+                if mem:
+                    max_allocated_gib = mem.get('max_allocated', 0) / (1024 ** 3)
+                    batch_pbar.set_postfix({'max_mem': f'{max_allocated_gib:.2f}GiB'})
+
             train_loss = np.average(train_loss)
+            # 1. 保存当前状态（包含优化器，否则无法继续训练）
+            state = {
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': model_optim.state_dict(),
+            }
+            torch.save(state, temp_checkpoint_path)
 
+            # 2. 彻底销毁对象并回收显存
+            # 注意：优化器占用的显存通常是模型的 2-3 倍（Adam 记录了动量等信息）
+            del self.model
+            del model_optim
+            manage_device_memory(self.args.device_type, force_gc=True) 
+
+            # 3. 重新构建模型进行验证
+            self.model = self._build_model().to(self.device)
+            checkpoint = torch.load(temp_checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # 4. 执行验证和测试
+            # 此时显存中只有模型，没有优化器的状态，空间更充裕
             vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
             test_loss, test_acc, test_auc, test_recall, test_F1 = self.vali(test_data, test_loader, criterion)
+
             epoch_duration = time.time() - epoch_time
             last_loss = loss.item()
             self._print_stage(
                 '训练',
                 (
-                    f'第 {epoch + 1}/{self.args.train_epochs} 轮完成 | 已执行 batch: {completed_steps}/{train_steps} | '
+                    f'第 {epoch + 1}/{self.args.train_epochs} 轮完成'
                     f'平均训练损失: {self._format_metric(train_loss)} | 最后一个 batch 损失: {self._format_metric(last_loss)} | '
                     f'耗时: {epoch_duration:.2f}s'
                 )
             )
-            if speed > 0:
-                self._print_stage('训练', f'最近估计速度: {speed:.4f}s/batch | 预计剩余: {left_time:.2f}s')
             self._print_metric_block('验证', vali_loss, vali_acc, vali_auc, vali_recall, vali_F1)
             self._print_metric_block('测试', test_loss, test_acc, test_auc, test_recall, test_F1)
-            self._manage_runtime_memory('epoch收尾', force_gc=getattr(self.args, 'xpu_force_gc', False))
+            manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
             best_model_file = os.path.join(
-                self.args.saved_models_dir,
+                self.args.checkpoint_dir,
                 f"train_loss{train_loss:.7f}vali_loss{vali_loss:.7f}.pt"
             )
             early_stopping(vali_loss, self.model, best_model_file)
+            self._append_output(
+                'epoch_complete',
+                {
+                    'setting': setting,
+                    'epoch': epoch + 1,
+                    'temp_checkpoint_path': temp_checkpoint_path,
+                    'best_model_file': early_stopping.best_model_file,
+                    'train_loss': train_loss,
+                    'vali_loss': vali_loss,
+                    'vali_acc': vali_acc,
+                    'vali_auc': vali_auc,
+                    'vali_recall': vali_recall,
+                    'vali_f1': vali_F1,
+                    'test_loss': test_loss,
+                    'test_acc': test_acc,
+                    'test_auc': test_auc,
+                    'test_recall': test_recall,
+                    'test_f1': test_F1,
+                },
+            )
             if early_stopping.early_stop:
                 self._print_stage('训练', '触发提前停止，结束后续轮次。')
                 break
-
+                        # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
+            
+            # 5. 重新实例化优化器并加载状态
+            model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+            model_optim.load_state_dict(checkpoint['optimizer_state_dict'])
             adjust_learning_rate(model_optim, epoch + 1, self.args)
 
-        self.best_model_file = early_stopping.get_best_model_file()
-        if self.best_model_file is None:
-            raise RuntimeError('训练过程中没有得到任何有限的验证集损失，无法加载最优模型。')
+        self.best_model_file = early_stopping.best_model_file
+        if not self.best_model_file:
+            raise RuntimeError('训练结束后未找到可用的最优模型文件。')
         self._print_stage('训练', f'加载验证集表现最优的模型参数: {self.best_model_file}')
-        self._save_json(
-            os.path.join(record_dir, 'train_summary.json'),
+        self._append_output(
+            'train_complete',
             {
                 'best_model_file': self.best_model_file,
                 'setting': setting,
@@ -387,41 +621,40 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
-        raw_preds = []
-        raw_trues = []
-
-        folder_path = self._setting_dir(self.args.test_results_dir, setting)
 
         self.model.eval()
         stage_name = '测试'
         with torch.no_grad():
             for i, batch in enumerate(test_loader):
-                if self._debug_break(i):
-                    break
-
                 prepared_batch = self._prepare_batch(batch)
                 for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
-                    dec_inp = self._build_decoder_input(sample_y)
-                    outputs = self._forward(
-                        sample_x,
-                        sample_x_mark,
-                        dec_inp,
-                        sample_y_mark,
-                        f'{stage_name} sample={sample_index}',
-                    )
+                    sample_chunk_outputs = []
+                    sample_chunk_targets = []
+                    for chunk_index, (chunk_x, chunk_y, chunk_x_mark, chunk_y_mark) in enumerate(
+                        self._iter_stock_micro_batches(sample_x, sample_y, sample_x_mark, sample_y_mark)
+                    ):
+                        dec_inp = self._build_decoder_input(chunk_y)
+                        outputs = self._forward(
+                            chunk_x,
+                            chunk_x_mark,
+                            dec_inp,
+                            chunk_y_mark,
+                            f'{stage_name} sample={sample_index} chunk={chunk_index}',
+                        )
+                        targets = self._extract_target_labels(chunk_y)
+                        sample_chunk_outputs.append(outputs.detach().cpu())
+                        sample_chunk_targets.append(targets.detach().cpu())
 
-                    targets = self._extract_target_labels(sample_y)
+                    sample_outputs = torch.cat(sample_chunk_outputs, dim=0)
+                    sample_targets = torch.cat(sample_chunk_targets, dim=0)
+                    outputs_np = sample_outputs.numpy()
+                    batch_y_np = sample_targets.numpy()
 
-                    outputs_np = outputs.detach().cpu().numpy()
-                    batch_y_np = targets.detach().cpu().numpy()
-
-                    raw_preds.append(outputs_np)
-                    raw_trues.append(batch_y_np)
                     preds.append(outputs_np.reshape(-1, 2))
                     trues.append(batch_y_np.reshape(-1))
 
                 if self._should_cleanup_after_batch(i):
-                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
+                    manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
         preds_tensor = torch.cat([torch.from_numpy(p) for p in preds], dim=0)
         trues_tensor = torch.cat([torch.from_numpy(t) for t in trues], dim=0)
@@ -429,106 +662,101 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         acc, auc, recall, f1 = calculate_metrics(preds_tensor, trues_tensor)
         self._print_metric_block('测试结果', 0.0, acc, auc, recall, f1)
 
-        preds_file_path = os.path.join(folder_path, 'preds.pt')
-        trues_file_path = os.path.join(folder_path, 'trues.pt')
-
-        torch.save(raw_preds, preds_file_path)
-        torch.save(raw_trues, trues_file_path)
-        self._save_json(
-            os.path.join(folder_path, 'metrics.json'),
+        metrics = {
+            'acc': float(acc),
+            'auc': float(auc),
+            'recall': float(recall),
+            'f1': float(f1),
+        }
+        self._append_output(
+            'test_metrics',
             {
-                'acc': float(acc),
-                'auc': float(auc),
-                'recall': float(recall),
-                'f1': float(f1),
+                'setting': setting,
+                'best_model_file': getattr(self, 'best_model_file', None),
+                **metrics,
             },
         )
-        self._print_stage('测试', f'预测 logits 已保存到: {preds_file_path}')
-        self._print_stage('测试', f'真实标签已保存到: {trues_file_path}')
-        self._manage_runtime_memory(stage_name, force_gc=getattr(self.args, 'xpu_force_gc', False))
+        manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
+        return metrics
 
-    def predict(self, setting, load=False):
-        pred_data, pred_loader = self._get_data(flag='pred')
+    def export_valid_test_factors(self, factor_column='factor', step_index=0):
+        result_frames = []
 
-        if load:
-            self._print_stage('预测', '加载最优模型参数用于未来数据预测。')
-            self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
+        for flag, dataset_split in (('val', 'valid'), ('test', 'test')):
+            split_data, split_loader = self._get_factor_export_data(flag)
+            split_frame = self._collect_split_factor_frame(
+                split_data,
+                split_loader,
+                dataset_split=dataset_split,
+                factor_column=factor_column,
+                step_index=step_index,
+            )
+            if not split_frame.empty:
+                result_frames.append(split_frame)
+                self._append_output(
+                    'factor_split_exported',
+                    {
+                        'dataset_split': dataset_split,
+                        'rows': len(split_frame),
+                        'trade_date_start': split_frame['trade_date'].min(),
+                        'trade_date_end': split_frame['trade_date'].max(),
+                    },
+                )
 
-        folder_path = self._setting_dir(self.args.pred_results_dir, setting)
+        if not result_frames:
+            raise RuntimeError('valid/test 因子导出结果为空。')
 
-        logits_all = []
-        probs_all = []
-
-        self.model.eval()
-        total_batches = len(pred_loader)
-        stage_name = '预测'
-        with torch.no_grad():
-            for i, batch in enumerate(pred_loader):
-                if self._debug_break(i):
-                    break
-                if i == 0 or (i + 1) == total_batches or (i + 1) % 10 == 0:
-                    self._print_stage('预测', f'正在处理第 {i + 1}/{total_batches} 个 batch')
-
-                prepared_batch = self._prepare_batch(batch)
-                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
-                    dec_inp = self._build_decoder_input(sample_y)
-                    outputs = self._forward(
-                        sample_x,
-                        sample_x_mark,
-                        dec_inp,
-                        sample_y_mark,
-                        f'{stage_name} sample={sample_index}',
-                    )
-
-                    probs = torch.softmax(outputs, dim=-1)
-                    logits_all.append(outputs.detach().cpu())
-                    probs_all.append(probs.detach().cpu())
-                if self._should_cleanup_after_batch(i):
-                    self._manage_runtime_memory(stage_name, batch_index=i, force_gc=getattr(self.args, 'xpu_force_gc', False))
-
-        pred_logits_path = os.path.join(folder_path, 'pred_logits.pt')
-        pred_probs_path = os.path.join(folder_path, 'pred_probs.pt')
-        torch.save(logits_all, pred_logits_path)
-        torch.save(probs_all, pred_probs_path)
-
-        if hasattr(pred_data, 'selected_codes') and hasattr(pred_data, 'future_dates'):
-            meta_rows = []
-            for trade_date in pred_data.future_dates:
-                for ts_code in pred_data.selected_codes:
-                    meta_rows.append({
-                        'ts_code': str(ts_code),
-                        'trade_date': pd.Timestamp(trade_date).strftime('%Y%m%d'),
-                    })
-            pd.DataFrame(meta_rows).to_csv(os.path.join(folder_path, 'prediction_index.csv'), index=False)
-
-        self._print_stage('预测', f'预测 logits 已保存到: {pred_logits_path}')
-        self._print_stage('预测', f'预测概率已保存到: {pred_probs_path}')
-        self._manage_runtime_memory(stage_name, force_gc=getattr(self.args, 'xpu_force_gc', False))
-
-    def export_prediction_factor(self, checkpoint_path, output_path, factor_column='factor'):
-        pred_data, pred_loader = self._get_data(flag='pred')
-        self.model.load_state_dict(load_checkpoint(checkpoint_path, self.device))
-        self.model.eval()
-
-        factor_frames = []
-        with torch.no_grad():
-            for batch in pred_loader:
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                dec_inp = self._build_decoder_input(batch_y)
-                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark, '因子导出')
-
-                up_prob = torch.softmax(outputs, dim=-1)[:, :, 1].detach().cpu().numpy()
-                factor_df = pd.DataFrame(up_prob, index=pred_data.selected_codes)
-                factor_df.columns = [pd.Timestamp(item).strftime('%Y%m%d') for item in pred_data.future_dates]
-                factor_df.index.name = 'ts_code'
-                factor_df = factor_df.stack().reset_index()
-                factor_df.columns = ['ts_code', 'trade_date', factor_column]
-                factor_frames.append(factor_df)
-
-        result = pd.concat(factor_frames, ignore_index=True)
+        result = pd.concat(result_frames, ignore_index=True)
+        output_path = self.args.factor_output_path
         output_dir = os.path.dirname(output_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        result.to_csv(output_path, index=False)
-        self._print_stage('因子导出', f'因子表已保存到: {output_path}')
+        result.to_parquet(output_path, compression='snappy')
+        self._append_output(
+            'factor_export_complete',
+            {
+                'factor_output_path': output_path,
+                'rows': len(result),
+            },
+        )
+        self._print_stage('因子导出', f'valid/test 因子表已保存到: {output_path}')
+        return result
+
+    def predict_factor_by_date(
+        self,
+        prediction_date,
+        checkpoint_path=None,
+        table_name=FACTOR_TABLE_NAME,
+        factor_column='factor',
+        append_if_missing=True,
+        step_index=0,
+    ):
+        resolved_checkpoint_path = checkpoint_path or getattr(self, 'best_model_file', None)
+        if not resolved_checkpoint_path:
+            raise ValueError('predict_factor_by_date 需要提供 checkpoint_path 或先完成训练。')
+
+        self.args.prediction_date = prediction_date
+        self.model.load_state_dict(load_checkpoint(resolved_checkpoint_path, self.device))
+        pred_data, pred_loader = self._get_data(flag='pred')
+        result = self._collect_prediction_factor_frame(
+            pred_data,
+            pred_loader,
+            factor_column=factor_column,
+            step_index=step_index,
+        )
+        if result.empty:
+            raise RuntimeError(f'prediction_date={prediction_date} 未生成任何因子值。')
+
+        if factor_column != 'factor':
+            db_ready = result.rename(columns={factor_column: 'factor'})
+        else:
+            db_ready = result.copy()
+
+        if append_if_missing:
+            self._append_factor_to_db_if_missing(db_ready, table_name=table_name)
+
+        self._print_stage(
+            '预测',
+            f'prediction_date={prediction_date} 因子计算完成，共 {len(result)} 条。'
+        )
         return result

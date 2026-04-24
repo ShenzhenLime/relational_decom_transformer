@@ -7,3 +7,4 @@ pandas>=2.3.3
 torch>=2.11.0
 scikit-learn>=1.8.0
 tqdm>=4.67.3
+fastparquet>=2026.3.0  # 可选，安装后支持 parquet 格式输出

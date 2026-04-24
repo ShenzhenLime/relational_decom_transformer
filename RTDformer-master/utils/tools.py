@@ -43,11 +43,13 @@ class EarlyStopping:
             self.best_score = score
             self.save_checkpoint(val_loss, model, path)
         elif score < self.best_score + self.delta:
+        ## 验证集损失没有下降，触发早停
             self.counter += 1
             print(f'[训练] 提前停止计数: {self.counter}/{self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
+        ## 验证集损失下降，保存模型并重置计数器
             self.best_score = score
             self.save_checkpoint(val_loss, model, path)
             self.counter = 0
@@ -62,5 +64,3 @@ class EarlyStopping:
         self.best_model_file = path
         self.val_loss_min = val_loss
 
-    def get_best_model_file(self):
-        return self.best_model_file

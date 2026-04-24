@@ -1,6 +1,8 @@
 import argparse
+from datetime import datetime
 from pathlib import Path
 from pprint import pformat
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import random
@@ -12,9 +14,9 @@ prepare_torch_runtime()
 import torch
 
 from experiments.exp_simple_acc import Exp_Long_Term_Forecast
-from const import ARTIFACTS_ROOT, DATA_PATH
+from const import ARTIFACTS_ROOT, DATA_PATH, FACTOR_OUTPUT_PATH
 
-MODEL_CHOICES = ['FourierGNN', 'Transformer', 'TDformer', 'Informer', 'Wformer', 'iTransformer', 'RTDformer2', 'FEDformer', 'PDF', 'StockMixer', 'DLinear']
+MODEL_CHOICES = ['FourierGNN', 'Transformer', 'TDformer', 'Informer', 'Wformer', 'iTransformer', 'RTDformer2', '3DDformer', 'FEDformer', 'PDF', 'StockMixer', 'DLinear']
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
@@ -27,35 +29,36 @@ parser = argparse.ArgumentParser(
 )
 
 general_group = parser.add_argument_group('general')
-general_group.add_argument('--is_training', type=int, default=1, help='1 for train+test, 0 for test only')
+general_group.add_argument('--run', type=str, default="train", help='run mode: train, test, or train+test')
 general_group.add_argument('--model_id', type=str, default='test', help='experiment id prefix')
-general_group.add_argument('--model', type=str, default='RTDformer2', choices=MODEL_CHOICES, help='model name')
+general_group.add_argument('--model', type=str, default='3Dformer', choices=MODEL_CHOICES, help='model name')
 general_group.add_argument('--data', type=str, default='StockDataset', help='dataset name used in experiment tags')
-general_group.add_argument('--itr', type=int, default=1, help='number of repeated experiments')
 general_group.add_argument('--des', type=str, default='test', help='experiment description suffix')
-add_bool_arg(general_group, '--do_predict', True, 'generate future prediction outputs after evaluation')
+general_group.add_argument('--checkpoint_path', type=str, default='', help='checkpoint path used by test/pred mode')
+add_bool_arg(general_group, '--save', True, 'persist run artifacts under results/<MM-DD-HH-mm>')
 
 data_group = parser.add_argument_group('data')
 data_group.add_argument('--features', type=str, default='MS', help='forecasting task mode: M / S / MS')
 data_group.add_argument('--target', type=str, default='close', help='target column name')
 data_group.add_argument('--freq', type=str, default='d', help='time feature frequency')
-data_group.add_argument('--prediction_dates', type=str, default='', help='comma-separated YYYYMMDD list or a text file path used by pred mode')
+data_group.add_argument('--prediction_date', type=str, default='', help='single YYYYMMDD used by pred mode')
 data_group.add_argument('--seq_len', type=int, default=48, help='input sequence length')
 data_group.add_argument('--label_len', type=int, default=24, help='decoder warmup length')
 data_group.add_argument('--pred_len', type=int, default=24, help='prediction horizon')
-data_group.add_argument('--dynamic_stock_cap', type=int, default=500, help='cap stocks per dynamic window')
+data_group.add_argument('--dynamic_stock_cap', type=int, default=10, help='cap stocks per dynamic window')
 
 model_group = parser.add_argument_group('model')
-model_group.add_argument('--top_k', type=int, default=50, help='Top-K for ISCA sparse attention (0=full attention)')
 model_group.add_argument('--enc_in', type=int, default=4, help='encoder input size')
 model_group.add_argument('--dec_in', type=int, default=4, help='decoder input size')
 model_group.add_argument('--c_out', type=int, default=2, help='model output size before final classifier')
-model_group.add_argument('--d_model', type=int, default=256, help='hidden dimension')
+model_group.add_argument('--d_model', type=int, default=128, help='hidden dimension')
 model_group.add_argument('--n_heads', type=int, default=4, help='attention heads')
 model_group.add_argument('--e_layers', type=int, default=1, help='encoder layers')
 model_group.add_argument('--d_layers', type=int, default=1, help='decoder layers')
-model_group.add_argument('--d_ff', type=int, default=1024, help='feed-forward dimension')
-model_group.add_argument('--moving_avg', type=int, default=25, help='moving-average window used by decomposition models')
+model_group.add_argument('--d_ff', type=int, default=512, help='feed-forward dimension')
+
+
+model_group.add_argument('--moving_avg', type=int, default=20, help='moving-average window used by decomposition models')
 model_group.add_argument('--factor', type=int, default=1, help='attention factor for Informer-like models')
 add_bool_arg(model_group, '--distil', True, 'enable encoder distilling in compatible models')
 model_group.add_argument('--dropout', type=float, default=0.1, help='dropout ratio')
@@ -77,10 +80,10 @@ add_bool_arg(model_group, '--output_stl', False, 'return decomposition component
 
 optimization_group = parser.add_argument_group('optimization')
 optimization_group.add_argument('--num_workers', type=int, default=1, help='dataloader workers')
-optimization_group.add_argument('--train_epochs', type=int, default=100, help='training epochs')
-optimization_group.add_argument('--batch_size', type=int, default=16, help='training batch size')
+optimization_group.add_argument('--train_epochs', type=int, default=1, help='training epochs')
+optimization_group.add_argument('--batch_size', type=int, default=400, help='training batch size')
 optimization_group.add_argument('--patience', type=int, default=3, help='early stopping patience')
-optimization_group.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+optimization_group.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
 optimization_group.add_argument('--lradj', type=str, default='type1', help='learning rate schedule type')
 add_bool_arg(optimization_group, '--use_amp', True, 'enable CUDA automatic mixed precision')
 
@@ -90,19 +93,10 @@ device_group.add_argument('--gpu', type=int, default=0, help='preferred accelera
 add_bool_arg(device_group, '--use_multi_gpu', False, 'enable CUDA multi-GPU')
 device_group.add_argument('--devices', type=str, default='0,1,2,3', help='CUDA device ids for multi-GPU')
 
-xpu_group = parser.add_argument_group('xpu debug and memory')
-add_bool_arg(xpu_group, '--xpu_debug_mode', True, 'enable reduced-shape debug config on XPU')
-xpu_group.add_argument('--xpu_debug_epochs', type=int, default=1, help='epochs for XPU debug mode')
-xpu_group.add_argument('--xpu_debug_max_batches', type=int, default=5, help='max batches per loop on XPU debug mode')
-xpu_group.add_argument('--xpu_debug_batch_size', type=int, default=20, help='batch size for XPU debug mode')
-xpu_group.add_argument('--xpu_debug_d_model', type=int, default=128, help='hidden dimension for XPU debug mode')
-xpu_group.add_argument('--xpu_debug_d_ff', type=int, default=512, help='feed-forward dimension for XPU debug mode')
-xpu_group.add_argument('--xpu_debug_n_heads', type=int, default=2, help='attention heads for XPU debug mode')
-xpu_group.add_argument('--xpu_debug_e_layers', type=int, default=1, help='encoder layers for XPU debug mode')
-xpu_group.add_argument('--xpu_debug_stock_cap', type=int, default=200, help='stock cap for XPU debug mode')
+xpu_group = parser.add_argument_group('xpu memory')
 xpu_group.add_argument('--xpu_memory_cleanup_interval', type=int, default=1, help='cleanup XPU memory every N batches; 0 disables')
 add_bool_arg(xpu_group, '--xpu_force_gc', True, 'force Python gc before XPU cache cleanup')
-add_bool_arg(xpu_group, '--xpu_log_memory', True, 'log XPU memory snapshot during runtime')
+add_bool_arg(xpu_group, '--xpu_log_memory', False, 'log XPU memory snapshot during runtime')
 
 
 def parse_runtime_args():
@@ -111,7 +105,18 @@ def parse_runtime_args():
     return parser.parse_args(args=[])
 
 
-def resolve_runtime_paths(args):
+def create_run_directory(root_dir):
+    timestamp = datetime.now().strftime('%m-%d-%H-%M')
+    candidate = root_dir / timestamp
+    collision_index = 1
+    while candidate.exists():
+        candidate = root_dir / f'{timestamp}_{collision_index:02d}'
+        collision_index += 1
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def resolve_runtime_paths(args, run_dir=None):
     data_path = Path(DATA_PATH)
     output_root = PROJECT_ROOT / ARTIFACTS_ROOT
 
@@ -121,33 +126,46 @@ def resolve_runtime_paths(args):
     args.output_root = str(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    for attr_name, folder_name in (
-        ('checkpoints_dir', 'checkpoints'),
-        ('saved_models_dir', 'saved_models'),
-        ('test_results_dir', 'test_results'),
-        ('pred_results_dir', 'pred_results'),
-        ('factor_results_dir', 'factor_results'),
-        ('run_records_dir', 'run_records'),
-    ):
-        setattr(args, attr_name, str(output_root / folder_name))
+    run_path = Path(run_dir) if run_dir is not None else create_run_directory(output_root)
+    checkpoint_dir = run_path / 'checkpoint'
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    args.run_dir = str(run_path)
+    args.run_name = run_path.name
+    args.checkpoint_dir = str(checkpoint_dir)
+    args.args_json_path = str(run_path / 'args.json')
+    args.output_json_path = str(run_path / 'output.json')
+    args.factor_output_path = str(run_path / FACTOR_OUTPUT_PATH)
+
+    args.checkpoints_dir = str(checkpoint_dir)
+    args.saved_models_dir = str(checkpoint_dir)
+    args.test_results_dir = str(run_path)
+    args.pred_results_dir = str(run_path)
+    args.factor_results_dir = str(run_path)
+    args.run_records_dir = str(run_path)
 
     args.checkpoints = args.checkpoints_dir
     return args
 
 
-args = resolve_runtime_paths(resolve_device_config(parse_runtime_args()))
+args = resolve_device_config(parse_runtime_args())
 
 
-from tqdm import tqdm
+def resolve_project_path(raw_path):
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((PROJECT_ROOT / candidate).resolve())
+
+
 
 
 def build_setting(args, run_index):
     return (
-        f"{args.model_id}_{args.model}_{args.data}_{args.features}"
-        f"_ft{args.seq_len}_sl{args.label_len}_ll{args.pred_len}"
-        f"_pl{args.d_model}_dm{args.n_heads}_nh{args.e_layers}"
-        f"_el{args.d_layers}_dl{args.d_ff}_df{args.factor}_fc{args.embed}"
-        f"_eb{args.distil}_dt{args.des}_{args.class_strategy}_{run_index}"
+        f"{args.model_id}_{args.model}"
+        f"_seq{args.seq_len}_lable{args.label_len}_pred{args.pred_len}"
+        f"_dm{args.d_model}_head{args.n_heads}_el{args.e_layers}"
+        f"_dl{args.d_layers}_df{args.d_ff}"
     )
 
 
@@ -163,7 +181,7 @@ def print_args_summary(args):
     print(pformat(vars(args), sort_dicts=True, width=100))
     print(
         f"运行设备: {str(args.device_type).upper()} | 模型: {args.model} | 数据集: {args.data} | "
-        f"训练轮数: {args.train_epochs} | 实验次数: {args.itr}"
+        f"训练轮数: {args.train_epochs}"
     )
 
 if __name__ == '__main__':
@@ -172,37 +190,55 @@ if __name__ == '__main__':
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
 
-    print_args_summary(args)
-
-    Exp = Exp_Long_Term_Forecast
-
-
-    if args.is_training:
-        for ii in tqdm(range(args.itr), desc="实验进度"):
-            setting = build_setting(args, ii)
-
-            exp = Exp(args)  # set experiments
-            print_section(
-                f'第 {ii + 1}/{args.itr} 次实验',
-                f'实验标识: {setting}\n流程: 训练 -> 测试' + (' -> 预测' if args.do_predict else '')
-            )
-            print('[训练阶段] 开始训练模型')
-            exp.train(setting)
-
-            print('[测试阶段] 开始评估模型')
-            exp.test(setting)
-
-            if args.do_predict:
-                print('[预测阶段] 开始生成未来预测结果')
-                exp.predict(setting, True)
-
-            empty_cache(args.device_type)
+    temp_run_dir = None
+    persist_results = args.save and args.run != 'pred'
+    if persist_results:
+        args = resolve_runtime_paths(args)
     else:
-        ii = 0
-        setting = build_setting(args, ii)
+        temp_run_dir = TemporaryDirectory(prefix='rtdformer_run_')
+        args = resolve_runtime_paths(args, run_dir=temp_run_dir.name)
 
-        exp = Exp(args)  # set experiments
-        print_section('测试任务', f'实验标识: {setting}')
-        print('[测试阶段] 开始评估模型')
-        exp.test(setting, test=1)
-        empty_cache(args.device_type)
+    if args.checkpoint_path:
+        args.checkpoint_path = resolve_project_path(args.checkpoint_path)
+
+    try:
+        print_args_summary(args)
+
+        Exp = Exp_Long_Term_Forecast
+
+        if args.run == 'train':
+            setting = build_setting(args, 0)
+            exp = Exp(args)
+            exp.train(setting)
+            exp.test(setting)
+            if args.save:
+                exp.export_valid_test_factors()
+            empty_cache(args.device_type)
+        elif args.run == 'test':
+            if not args.checkpoint_path:
+                raise ValueError('test 模式需要提供 --checkpoint_path。')
+
+            setting = build_setting(args, 0)
+            exp = Exp(args)
+            exp.best_model_file = args.checkpoint_path
+            print_section('测试任务', f'实验标识: {setting}')
+            print('[测试阶段] 开始评估模型')
+            exp.test(setting, test=1)
+            empty_cache(args.device_type)
+        elif args.run == 'pred':
+            if not args.prediction_date:
+                raise ValueError('pred 模式需要提供 --prediction_date。')
+            if not args.checkpoint_path:
+                raise ValueError('pred 模式需要提供 --checkpoint_path。')
+
+            exp = Exp(args)
+            exp.predict_factor_by_date(
+                prediction_date=args.prediction_date,
+                checkpoint_path=args.checkpoint_path,
+            )
+            empty_cache(args.device_type)
+        else:
+            raise ValueError(f'不支持的 run 模式: {args.run}')
+    finally:
+        if temp_run_dir is not None:
+            temp_run_dir.cleanup()

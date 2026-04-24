@@ -1,4 +1,6 @@
 import importlib
+import importlib.util
+import os
 import torch
 from utils.device_utils import acquire_device
 
@@ -11,6 +13,7 @@ MODEL_MODULES = {
     'Wformer': 'model.Wformer',
     'iTransformer': 'model.iTransformer',
     'RTDformer2': 'model.RTDformer2',
+    '3Dformer': 'model.3Dformer',  # 文件名含连字符，通过文件路径加载
     'FEDformer': 'model.FEDformer',
     'PDF': 'model.PDF',
     'StockMixer': 'model.StockMixer',
@@ -27,8 +30,7 @@ def load_model_module(model_name):
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             f'无法导入模型 {model_name} 对应模块 {module_name}。'
-            '如果你当前运行的是 RTDformer2 云端最小部署包，请只使用 --model RTDformer2，'
-            '因为该部署包不会包含其他模型文件。'
+            '如果你当前运行的是云端最小部署包，请确认对应模型文件存在。'
         ) from exc
 
 class Exp_Basic(object):

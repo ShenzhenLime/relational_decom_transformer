@@ -17,17 +17,11 @@ RTDformer 当前用于做 A 股日频 OHLC 序列上的涨跌二分类。
 
 - 输入：过去 seq_len 个交易日的 open、high、low、close
 - 输出：未来 pred_len 个交易日相对预测窗口第一天的涨跌标签
-- 默认模型：RTDformer2
+- 默认模型：3D-Transformer
 - 默认数据文件：data/a_share_dynamic.pt
 - 默认标签列：close
 
-标签生成逻辑在 experiments/exp_simple_acc.py 中，规则是：
-
-1. 取预测窗口内的 close
-2. 用预测窗口第一天的 close 作为基准
-3. 后续日期高于基准记为 1，否则记为 0
-
-损失函数使用 NLLLoss，模型输出是二分类对数概率。
+3D-Transformer 是在 RTDformer2 基础上去掉 ISCA（Inter-Stock Correlation Attention）层的变体，直接将 seasonal、trend、residual 三成分经门控层加权后相加，再经 log_softmax 输出二分类对数概率。与 RTDformer2 相比，结构更简洁，去掉了跨股票注意力和 ACC 分类头。
 
 ## 2. 当前目录结构
 
@@ -280,7 +274,7 @@ python run.py --no-use_gpu
 
 ### 12.2 模型相关
 
-- model：模型名，默认 RTDformer2
+- model：模型名，默认 3D-Transformer
 - d_model：隐藏维度，最影响显存
 - d_ff：前馈层宽度，通常和 d_model 一起调
 - n_heads：注意力头数
@@ -437,80 +431,78 @@ pip install -r requirements.txt
 单卡 CUDA 训练示例：
 
 ```bash
-python run.py --model RTDformer2 --use_gpu --gpu 0 --batch_size 4 --train_epochs 20 --use_amp
+python run.py --model 3D-Transformer --use_gpu --gpu 0 --batch_size 4 --train_epochs 20 --use_amp
 ```
 
 训练产物会统一写到 `artifacts` 下：
 
 - `artifacts/saved_models`
-- `artifacts/test_results`
-- `artifacts/pred_results`
-- `artifacts/run_records`
-
-其中最关键的是：
-
-- `artifacts/saved_models/*.pt`
-- `artifacts/run_records/<setting>/args.json`
+- `results/<MM-DD-HH-mm>/args.json`
+- `results/<MM-DD-HH-mm>/output.json`
+- `results/<MM-DD-HH-mm>/checkpoint/`
+- `results/<MM-DD-HH-mm>/valid_test_factor.parquet`
 
 ## 5. 云端导出预测结果文件
 
-如果你要直接在云端生成预测因子 CSV，可以在训练后执行：
+训练完成后，云端会自动在当次运行目录下导出完整的 valid/test 因子 parquet，不再需要额外执行导出脚本。
 
 ```bash
-python run.py --model RTDformer2 --is_training 0 --do_predict --prediction_dates 20260421,20260422,20260423,20260424,20260425
+python run.py --model 3Dformer --save
 ```
 
-更常见的是只把 checkpoint 和 `args.json` 拉回本地，再在本地导出因子表。
+其中：
+
+- `args.json` 保存本次运行参数
+- `checkpoint/temp_epoch_end.pt` 保存每轮训练后的临时权重
+- `checkpoint/train_loss*.pt` 保存验证最优模型
+- `output.json` 追加记录训练/验证/测试关键输出
+- `valid_test_factor.parquet` 保存 valid/test 每个窗口的因子值
 
 ## 6. 把云端产物拉回本地
 
 至少下载这两个文件：
 
-- `artifacts/saved_models/<你的模型文件>.pt`
-- `artifacts/run_records/<setting>/args.json`
+- `results/<MM-DD-HH-mm>/checkpoint/<你的模型文件>.pt`
+- `results/<MM-DD-HH-mm>/valid_test_factor.parquet`
 
 同时确保本地仍然保留训练时使用的：
 
 - `data/a_share_dynamic.pt`
 
-## 7. 本地导出预测因子 CSV
+## 7. 本地把因子 parquet 入库到 quant DuckDB
 
-下面命令会输出一个标准三列表（`ts_code`、`trade_date`、`factor`）：
-
-```bash
-python tools/export_factor_table.py ^
-  --run-config artifacts/run_records/<setting>/args.json ^
-  --checkpoint-path artifacts/saved_models/<你的模型文件>.pt ^
-  --data-root data ^
-  --data-path a_share_dynamic.pt ^
-  --prediction-dates 20260421,20260422,20260423,20260424,20260425 ^
-  --output-path artifacts/factor_results/rtdformer_factor.csv ^
-  --factor-column factor
-```
-
-## 8. 本地把因子 CSV 入库到 quant DuckDB
+下面命令会把 parquet 导入到 DuckDB 中的 `3Dformer` 表：
 
 ```bash
-python tools/import_factor_to_db.py --csv-path artifacts/factor_results/rtdformer_factor.csv --table-name dl_rtdformer_factor
+python tools/import_factor_to_db.py --parquet-path results/<MM-DD-HH-mm>/valid_test_factor.parquet
 ```
 
 默认行为：
 
+- 目标表固定为 `3Dformer`
 - 目标表不存在则自动创建
 - 目标表已存在时，先删除本次 `trade_date` 对应旧记录，再 append 新记录
 
 如果你就是想保留历史重复日期并直接追加：
 
 ```bash
-python tools/import_factor_to_db.py --csv-path artifacts/factor_results/rtdformer_factor.csv --table-name dl_rtdformer_factor --keep-existing-dates
+python tools/import_factor_to_db.py --parquet-path results/<MM-DD-HH-mm>/valid_test_factor.parquet --keep-existing-dates
 ```
+
+## 8. 本地按单日期补充因子
+
+```bash
+python run.py --run pred --checkpoint_path results/<MM-DD-HH-mm>/checkpoint/<你的模型文件>.pt --prediction_date 20260424 --no-save
+```
+
+这会根据 `prediction_date` 前的历史窗口计算该日因子；如果 DuckDB 的 `3Dformer` 表里还没有这个 `trade_date`，则自动 append。
 
 ## 9. 本地验证因子表是否入库成功
 
 ```python
 from quant_infra import db_utils
 
-df = db_utils.read_sql("SELECT * FROM dl_rtdformer_factor ORDER BY trade_date, ts_code LIMIT 20")
+df = db_utils.read_sql("SELECT * FROM 3Dformer ORDER BY trade_date, ts_code LIMIT 20")
 print(df)
 ```
 
@@ -519,15 +511,16 @@ print(df)
 ```python
 from quant_infra.factor_analyze import evaluate_factor
 
-evaluate_factor('dl_rtdformer_factor', fac_freq='日度')
+evaluate_factor('3Dformer', fac_freq='日度')
 ```
 
 ## 11. 对应代码位置
 
 - 本地制数脚本：`tools/prepare_local_data.py`
 - 云端训练入口：`run.py`
-- 本地导出预测因子：`tools/export_factor_table.py`
-- 本地入库函数：`src/quant_infra/factor_calc.py` 中的 `import_factor_table_from_csv`
+- valid/test 因子导出：`experiments/exp_simple_acc.py` 中的 `export_valid_test_factors`
+- 本地单日期补库：`experiments/exp_simple_acc.py` 中的 `predict_factor_by_date`
+- 本地入库函数：`src/quant_infra/factor_calc.py` 中的 `import_factor_table_from_parquet`
 - 本地入库脚本：`tools/import_factor_to_db.py`
 
 ---
@@ -565,7 +558,7 @@ evaluate_factor('dl_rtdformer_factor', fac_freq='日度')
 * **动作：** 将分别预测好的趋势、周期和残差三个维度的未来特征进行加和，重构出完整的未来序列特征表示。
 
 **6. 全局提炼与任务输出 (Global Refinement & Output)**
-* **流程：** 融合后的特征再次经过一个全注意力层（`self.full_attention`）进行全局特征平滑和提炼。随后通过线性层 `projector2` 将高维特征降维到 2（二分类输出）。最后经过 ELU 激活和 Log-Softmax 输出概率分布。
+* **流程：** 最后经过  Log-Softmax 输出概率分布。
 
 ---
 

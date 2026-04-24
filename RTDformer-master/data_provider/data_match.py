@@ -24,11 +24,8 @@ def data_provider(args, flag, print_debug):
     flag_name = flag_name_map.get(flag, flag)
 
     timeenc = 0 if args.embed != 'timeF' else 1
-    stock_cap = getattr(args, 'dynamic_stock_cap', None)
-    if args.device_type == 'xpu' and getattr(args, 'xpu_debug_mode', False):
-        debug_stock_cap = getattr(args, 'xpu_debug_stock_cap', None)
-        if debug_stock_cap is not None:
-            stock_cap = debug_stock_cap if stock_cap is None else min(stock_cap, debug_stock_cap)
+    train_stock_cap = getattr(args, 'dynamic_stock_cap', None)
+    stock_cap = train_stock_cap if flag == 'train' else None
 
     if flag == 'test':
         shuffle_flag = False
@@ -65,7 +62,7 @@ def data_provider(args, flag, print_debug):
         timeenc=timeenc,    #1
         freq=freq  ,     #d
         stock_cap=stock_cap,
-        prediction_dates=getattr(args, 'prediction_dates', None) if flag == 'pred' else None,
+        prediction_date=getattr(args, 'prediction_date', None) if flag == 'pred' else None,
     )
     args.num_stock = data_set.num_stock
     if getattr(data_set, 'dynamic_stock_pool', False):

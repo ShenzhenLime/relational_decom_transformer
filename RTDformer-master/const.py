@@ -1,6 +1,6 @@
 TRAIN_END_DATE = '2023-01-01'
 
-VALID_END_DATE = '2025-11-01'
+VALID_END_DATE = '2025-01-01'
 ## 后面就是测试集（一直到最后一天）
 
 DATA_PATH = 'data/a_share_dynamic.pt'
@@ -10,6 +10,9 @@ ARTIFACTS_ROOT = 'results'
 CLOUD_BUNDLE_DIR = 'deploy/rtdformer2_cloud'
 CLOUD_BUNDLE_ARCHIVE_PATH = f'{CLOUD_BUNDLE_DIR}.zip'
 
+FACTOR_OUTPUT_PATH = 'valid_test_factor.parquet'
+FACTOR_TABLE_NAME = '3Dformer'
+
 RTDFORMER2_CLOUD_BUNDLE_FILES = (
 	'const.py',
 	'run.py',
@@ -18,7 +21,7 @@ RTDFORMER2_CLOUD_BUNDLE_FILES = (
 	'data_provider/data_match.py',
 	'experiments/exp_basic.py',
 	'experiments/exp_simple_acc.py',
-	'model/RTDformer2.py',
+	'model/3Dformer.py',
 	'layers/Attention.py',
 	'layers/TDformer_EncDec.py',
 	'layers/Embed.py',

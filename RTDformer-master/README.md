@@ -439,6 +439,7 @@ python run.py --model 3D-Transformer --use_gpu --gpu 0 --batch_size 4 --train_ep
 - `artifacts/saved_models`
 - `results/<MM-DD-HH-mm>/args.json`
 - `results/<MM-DD-HH-mm>/output.json`
+- `results/<MM-DD-HH-mm>/tensorboard/`
 - `results/<MM-DD-HH-mm>/checkpoint/`
 - `results/<MM-DD-HH-mm>/valid_test_factor.parquet`
 
@@ -455,8 +456,15 @@ python run.py --model 3Dformer --save
 - `args.json` 保存本次运行参数
 - `checkpoint/temp_epoch_end.pt` 保存每轮训练后的临时权重
 - `checkpoint/train_loss*.pt` 保存验证最优模型
-- `output.json` 追加记录训练/验证/测试关键输出
+- `output.json` 仅记录低频关键事件，不再逐 epoch 追加 loss 明细
+- `tensorboard/` 保存 train/valid/test loss 学习曲线
 - `valid_test_factor.parquet` 保存 valid/test 每个窗口的因子值
+
+查看学习曲线：
+先打开一个新的终端，运行以下命令。然后打开浏览器
+```bash
+tensorboard --logdir results/<MM-DD-HH-mm>/tensorboard
+```
 
 ## 6. 把云端产物拉回本地
 

@@ -47,6 +47,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super().__init__(args)
         self.print_debug = False
+        self._visual_writer = None
 
     @staticmethod
     def _format_metric(value):
@@ -111,6 +112,45 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         )
         self._save_json(output_path, entries)
 
+    def _get_visual_writer(self):
+        log_dir = getattr(self.args, 'tensorboard_dir', '')
+        if not log_dir:
+            return None
+
+        if self._visual_writer is not None:
+            return self._visual_writer
+
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                '缺少 tensorboard 依赖，无法写入训练曲线。请先安装 tensorboard。'
+            ) from exc
+
+        os.makedirs(log_dir, exist_ok=True)
+        self._visual_writer = SummaryWriter(log_dir=log_dir)
+        self._print_stage('训练', f'TensorBoard 日志目录: {log_dir}')
+        self._print_stage('训练', f'可通过 tensorboard --logdir "{log_dir}" 查看学习曲线。')
+        return self._visual_writer
+
+    def _log_loss_curves(self, epoch, train_loss, vali_loss, test_loss):
+        writer = self._get_visual_writer()
+        if writer is None:
+            return
+
+        global_step = int(epoch)
+        writer.add_scalar('loss/train', float(train_loss), global_step)
+        writer.add_scalar('loss/val', float(vali_loss), global_step)
+        writer.add_scalar('loss/test', float(test_loss), global_step)
+        writer.flush()
+
+    def _close_visual_writer(self):
+        if self._visual_writer is None:
+            return
+
+        self._visual_writer.close()
+        self._visual_writer = None
+
     def _save_run_config(self, setting):
         self._save_json(
             self.args.args_json_path,
@@ -124,6 +164,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 'setting': setting,
                 'run_dir': self.args.run_dir,
                 'checkpoint_dir': self.args.checkpoint_dir,
+                'tensorboard_dir': getattr(self.args, 'tensorboard_dir', ''),
             },
         )
         return self.args.run_dir
@@ -464,143 +505,136 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         manage_device_memory(self.args.device_type, force_gc=True, reset_peak=True)
 
-        for epoch in range(self.args.train_epochs):
-            train_loss = []
-            self.model.train()
-            epoch_time = time.time()
-            stage_name = f'训练 epoch={epoch + 1}'
+        try:
+            for epoch in range(self.args.train_epochs):
+                train_loss = []
+                self.model.train()
+                epoch_time = time.time()
+                stage_name = f'训练 epoch={epoch + 1}'
 
-            batch_pbar = tqdm(
-                train_loader,
-                desc=f'Epoch [{epoch + 1}/{self.args.train_epochs}]',
-                dynamic_ncols=True,
-                mininterval=60, # 60s
-            )
-            for i, batch in enumerate(batch_pbar):
-                model_optim.zero_grad()
-
-                prepared_batch = self._prepare_batch(batch)
-                batch_outputs = []
-                batch_targets = []
-                for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
-                    dec_inp = self._build_decoder_input(sample_y)
-                    outputs = self._forward(
-                        sample_x,
-                        sample_x_mark,
-                        dec_inp,
-                        sample_y_mark,
-                        f'{stage_name} sample={sample_index}',
-                    )
-                    targets = self._extract_target_labels(sample_y, as_int=True).reshape(-1).to(torch.long)
-                    batch_outputs.append(outputs.reshape(-1, 2))
-                    batch_targets.append(targets)
-
-                outputs = torch.cat(batch_outputs, dim=0)
-                batch_y = torch.cat(batch_targets, dim=0)
-                loss = criterion(outputs, batch_y)
-                self._ensure_finite(f'{stage_name} loss', loss)
-                train_loss.append(loss.item())
-
-                if self.args.use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    model_optim.step()
-                if self._should_cleanup_after_batch(i):
-                    manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
-
-                mem = device_memory_snapshot(self.args.device_type)
-                if mem:
-                    max_allocated_gib = mem.get('max_allocated', 0) / (1024 ** 3)
-                    batch_pbar.set_postfix({'max_mem': f'{max_allocated_gib:.2f}GiB'})
-
-            train_loss = np.average(train_loss)
-            # 1. 保存当前状态（包含优化器，否则无法继续训练）
-            state = {
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': model_optim.state_dict(),
-            }
-            torch.save(state, temp_checkpoint_path)
-
-            # 2. 彻底销毁对象并回收显存
-            # 注意：优化器占用的显存通常是模型的 2-3 倍（Adam 记录了动量等信息）
-            del self.model
-            del model_optim
-            manage_device_memory(self.args.device_type, force_gc=True) 
-
-            # 3. 重新构建模型进行验证
-            self.model = self._build_model().to(self.device)
-            checkpoint = torch.load(temp_checkpoint_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            
-            # 4. 执行验证和测试
-            # 此时显存中只有模型，没有优化器的状态，空间更充裕
-            vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
-            test_loss, test_acc, test_auc, test_recall, test_F1 = self.vali(test_data, test_loader, criterion)
-
-            epoch_duration = time.time() - epoch_time
-            last_loss = loss.item()
-            self._print_stage(
-                '训练',
-                (
-                    f'第 {epoch + 1}/{self.args.train_epochs} 轮完成'
-                    f'平均训练损失: {self._format_metric(train_loss)} | 最后一个 batch 损失: {self._format_metric(last_loss)} | '
-                    f'耗时: {epoch_duration:.2f}s'
+                batch_pbar = tqdm(
+                    train_loader,
+                    desc=f'Epoch [{epoch + 1}/{self.args.train_epochs}]',
+                    dynamic_ncols=True,
+                    mininterval=60, # 60s
                 )
-            )
-            self._print_metric_block('验证', vali_loss, vali_acc, vali_auc, vali_recall, vali_F1)
-            self._print_metric_block('测试', test_loss, test_acc, test_auc, test_recall, test_F1)
-            manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
+                for i, batch in enumerate(batch_pbar):
+                    model_optim.zero_grad()
 
-            best_model_file = os.path.join(
-                self.args.checkpoint_dir,
-                f"train_loss{train_loss:.7f}vali_loss{vali_loss:.7f}.pt"
-            )
-            early_stopping(vali_loss, self.model, best_model_file)
+                    prepared_batch = self._prepare_batch(batch)
+                    batch_outputs = []
+                    batch_targets = []
+                    for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
+                        dec_inp = self._build_decoder_input(sample_y)
+                        outputs = self._forward(
+                            sample_x,
+                            sample_x_mark,
+                            dec_inp,
+                            sample_y_mark,
+                            f'{stage_name} sample={sample_index}',
+                        )
+                        targets = self._extract_target_labels(sample_y, as_int=True).reshape(-1).to(torch.long)
+                        batch_outputs.append(outputs.reshape(-1, 2))
+                        batch_targets.append(targets)
+
+                    outputs = torch.cat(batch_outputs, dim=0)
+                    batch_y = torch.cat(batch_targets, dim=0)
+                    loss = criterion(outputs, batch_y)
+                    self._ensure_finite(f'{stage_name} loss', loss)
+                    train_loss.append(loss.item())
+
+                    if self.args.use_amp:
+                        scaler.scale(loss).backward()
+                        scaler.step(model_optim)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        model_optim.step()
+                    if self._should_cleanup_after_batch(i):
+                        manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
+
+                    mem = device_memory_snapshot(self.args.device_type)
+                    if mem:
+                        max_allocated_gib = mem.get('max_allocated', 0) / (1024 ** 3)
+                        batch_pbar.set_postfix({'max_mem': f'{max_allocated_gib:.2f}GiB'})
+
+                train_loss = np.average(train_loss)
+                # 1. 保存当前状态（包含优化器，否则无法继续训练）
+                state = {
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': model_optim.state_dict(),
+                }
+                torch.save(state, temp_checkpoint_path)
+
+                # 2. 彻底销毁对象并回收显存
+                # 注意：优化器占用的显存通常是模型的 2-3 倍（Adam 记录了动量等信息）
+                del self.model
+                del model_optim
+                manage_device_memory(self.args.device_type, force_gc=True)
+
+                # 3. 重新构建模型进行验证
+                self.model = self._build_model().to(self.device)
+                checkpoint = torch.load(temp_checkpoint_path, map_location=self.device)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+
+                # 4. 执行验证和测试
+                # 此时显存中只有模型，没有优化器的状态，空间更充裕
+                vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
+                test_loss, test_acc, test_auc, test_recall, test_F1 = self.vali(test_data, test_loader, criterion)
+
+                epoch_duration = time.time() - epoch_time
+                last_loss = loss.item()
+                self._print_stage(
+                    '训练',
+                    (
+                        f'第 {epoch + 1}/{self.args.train_epochs} 轮完成'
+                        f'平均训练损失: {self._format_metric(train_loss)} | 最后一个 batch 损失: {self._format_metric(last_loss)} | '
+                        f'耗时: {epoch_duration:.2f}s'
+                    )
+                )
+                self._print_metric_block('验证', vali_loss, vali_acc, vali_auc, vali_recall, vali_F1)
+                self._print_metric_block('测试', test_loss, test_acc, test_auc, test_recall, test_F1)
+                self._log_loss_curves(
+                    epoch=epoch + 1,
+                    train_loss=train_loss,
+                    vali_loss=vali_loss,
+                    test_loss=test_loss,
+                )
+                manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
+
+                best_model_file = os.path.join(
+                    self.args.checkpoint_dir,
+                    f"train_loss{train_loss:.7f}vali_loss{vali_loss:.7f}.pt"
+                )
+                early_stopping(vali_loss, self.model, best_model_file)
+                if early_stopping.early_stop:
+                    self._print_stage('训练', '触发提前停止，结束后续轮次。')
+                    break
+
+                # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
+                # 5. 重新实例化优化器并加载状态
+                model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+                model_optim.load_state_dict(checkpoint['optimizer_state_dict'])
+
+                adjust_learning_rate(model_optim, epoch, self.args)
+
+            self.best_model_file = early_stopping.best_model_file
+            if not self.best_model_file:
+                raise RuntimeError('训练结束后未找到可用的最优模型文件。')
+            self._print_stage('训练', f'加载验证集表现最优的模型参数: {self.best_model_file}')
             self._append_output(
-                'epoch_complete',
+                'train_complete',
                 {
-                    'epoch': epoch + 1,
-                    'learning_rate': model_optim.param_groups[0]['lr'],
-                    'temp_checkpoint_path': temp_checkpoint_path,
-                    'best_model_file': early_stopping.best_model_file,
-                    'train_loss': train_loss,
-                    'vali_loss': vali_loss,
-                    'vali_acc': vali_acc,
-                    'vali_auc': vali_auc,
-                    'vali_recall': vali_recall,
-                    'vali_f1': vali_F1,
-                    'test_loss': test_loss,
-                    'test_acc': test_acc,
-                    'test_auc': test_auc,
-                    'test_recall': test_recall,
-                    'test_f1': test_F1,
-                },
+                    'best_model_file': self.best_model_file,
+                    'tensorboard_dir': getattr(self.args, 'tensorboard_dir', ''),
+                }
             )
-            if early_stopping.early_stop:
-                self._print_stage('训练', '触发提前停止，结束后续轮次。')
-                break
-            
-            # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
-            # 5. 重新实例化优化器并加载状态
-            model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-            model_optim.load_state_dict(checkpoint['optimizer_state_dict'])
-            adjust_learning_rate(model_optim, epoch + 1, self.args)
 
-        self.best_model_file = early_stopping.best_model_file
-        if not self.best_model_file:
-            raise RuntimeError('训练结束后未找到可用的最优模型文件。')
-        self._print_stage('训练', f'加载验证集表现最优的模型参数: {self.best_model_file}')
-        self._append_output(
-            'train_complete',
-            {'best_model_file': self.best_model_file}
-        )
+            self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
 
-        self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
-
-        return self.model
+            return self.model
+        finally:
+            self._close_visual_writer()
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')

@@ -85,7 +85,7 @@ optimization_group.add_argument('--train_epochs', type=int, default=1, help='tra
 optimization_group.add_argument('--batch_size', type=int, default=400, help='training batch size')
 optimization_group.add_argument('--patience', type=int, default=3, help='early stopping patience')
 optimization_group.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
-optimization_group.add_argument('--lradj', type=str, default='type1', help='learning rate schedule type')
+optimization_group.add_argument('--alpha', type=float, default=0.8, help='learning rate decay factor for LambdaLR')
 ## 模型的精度会有问题，导致Loss为NaN
 add_bool_arg(optimization_group, '--use_amp', False, 'enable CUDA automatic mixed precision')
 
@@ -136,6 +136,7 @@ def resolve_runtime_paths(args, run_dir=None):
     args.checkpoint_dir = str(checkpoint_dir)
     args.args_json_path = str(run_path / 'args.json')
     args.output_json_path = str(run_path / 'output.json')
+    args.tensorboard_dir = str(run_path / 'tensorboard')
     args.factor_output_path = str(run_path / FACTOR_OUTPUT_PATH)
     return args
 
@@ -205,7 +206,7 @@ if __name__ == '__main__':
     if persist_results:
         args = resolve_runtime_paths(args)
     else:
-        temp_run_dir = TemporaryDirectory(prefix='rtdformer_run_')
+        temp_run_dir = TemporaryDirectory(prefix='3Dformer_run_')
         args = resolve_runtime_paths(args, run_dir=temp_run_dir.name)
 
     if args.checkpoint_path:

@@ -36,20 +36,15 @@ def require_prepared_dataset(root_path, data_path):
         )
     return pt_path
 
-
-def parse_prediction_date(prediction_date):
-    if prediction_date is None:
-        return None
-
-    raw_value = str(prediction_date).strip()
-    if not raw_value:
-        return None
-
-    parsed_dates = pd.to_datetime([raw_value], format='%Y%m%d', errors='raise')
-    return pd.Timestamp(parsed_dates[0])
-
-
 def build_future_dates(all_dates, start_index, start_date, pred_len):
+    """
+    构建未来日期索引
+    :param all_dates: 所有日期
+    :param start_index: 起始索引
+    :param start_date: 起始日期
+    :param pred_len: 预测长度
+    :return: 预测日期索引
+    """
     observed_dates = []
     if start_index is not None and 0 <= start_index < len(all_dates):
         observed_dates = list(all_dates[start_index:min(start_index + pred_len, len(all_dates))])
@@ -114,16 +109,6 @@ def build_window_code_indices(presence, required_window):
     return [np.flatnonzero(row == required_window) for row in window_sums]
 
 
-def cap_stock_indices(code_indices, stock_cap, sample_seed):
-    if stock_cap is None or len(code_indices) <= stock_cap:
-        return code_indices
-
-    rng = np.random.default_rng(sample_seed)
-    selected = rng.choice(code_indices, size=stock_cap, replace=False)
-    selected.sort()
-    return selected
-
-
 def select_train_stock_indices(split_values, history_days, code_indices, window_start,
                                seq_len, pred_len, stock_cap, close_col_index,
                                min_history_days=400, trim_ratio=0.01):
@@ -182,7 +167,7 @@ class StockDataset(Dataset):
 
     def __init__(self, root_path, data_path, flag='train', size=None,
                  features='S', target='close', scale=True, timeenc=0, freq='h', print_debug=False,
-                 stock_cap=None, stock_sample_seed=2023, prediction_date=None):
+                 stock_cap=None, prediction_date=None):
         
         self.seq_len = size[0]
         self.label_len = size[1]
@@ -202,7 +187,6 @@ class StockDataset(Dataset):
         self.print_debug = print_debug 
         self.dynamic_stock_pool = True
         self.stock_cap = stock_cap
-        self.stock_sample_seed = stock_sample_seed
 
         self.root_path = root_path
         self.data_path = data_path
@@ -287,10 +271,7 @@ class StockDataset(Dataset):
                 for indices, window_start in zip(uncapped_code_indices, self.sample_window_starts)
             ]
         else:
-            filtered_code_indices = [
-                cap_stock_indices(indices, self.stock_cap, self.stock_sample_seed + int(window_start))
-                for indices, window_start in zip(uncapped_code_indices, self.sample_window_starts)
-            ]
+            filtered_code_indices = uncapped_code_indices
 
         filtered_sample_mask = np.array([len(indices) > 0 for indices in filtered_code_indices], dtype=bool)
         if not filtered_sample_mask.any():
@@ -347,34 +328,32 @@ class StockDataset(Dataset):
 
 
 class StockDataset_pred_long(Dataset):
-    _data_cache = StockDataset._data_cache
-
-    def __init__(self, root_path, data_path, flag='pred', size=None,
-                 features='S', target='close', scale=True, timeenc=0, freq='h', print_debug=False,
-                 stock_cap=None, stock_sample_seed=2023, prediction_date=None):
-        self.seq_len = size[0]
-        self.label_len = size[1]
-        self.pred_len = size[2]
-
-        assert flag == 'pred'
-        self.num_stock = None
+    def __init__(self, root_path, data_path, size, 
+                 features='S', target='close', scale=True, timeenc=0, freq='h', 
+                 prediction_date=None, **kwargs):
+        
+        # 参数初始化
+        self.seq_len, self.label_len, self.pred_len = size
         self.features = features
         self.target = target
         self.scale = scale
         self.timeenc = timeenc
         self.freq = freq
-        self.print_debug = print_debug
-        self.dynamic_stock_pool = True
-        self.stock_cap = stock_cap
-        self.stock_sample_seed = stock_sample_seed
         self.prediction_date = prediction_date
-
+        
         self.root_path = root_path
         self.data_path = data_path
+        
+        # 独立的私有缓存，不再与 StockDataset 共享
+        self._data_cache = {} 
+        self.tensors = None 
+        
         self.__read_data__()
 
     def __read_data__(self):
+        # 1. 数据加载
         pt_path = require_prepared_dataset(self.root_path, self.data_path)
+        # 仅在本实例内使用缓存
         cache = build_dense_cache(pt_path, self.target, self._data_cache)
 
         all_values = cache['values']
@@ -382,83 +361,73 @@ class StockDataset_pred_long(Dataset):
         all_dates = cache['dates']
         all_codes = cache['codes']
 
-        need_days = max(self.seq_len, self.label_len)
-        if len(all_dates) < need_days:
-            raise ValueError(
-                f"pred 模式所需交易日不足：至少需要 {need_days} 天，实际仅有 {len(all_dates)} 天。"
-            )
-
-        target_date = parse_prediction_date(self.prediction_date)
-        if target_date is None:
-            target_date = pd.Timestamp(all_dates[-1] + pd.offsets.BDay(1))
-            future_start_index = None
-            lookback_end = len(all_dates)
+        # 2. 预测基准点计算
+        target_date = pd.to_datetime(self.prediction_date, format='%Y%m%d')      
+          
+        # 定位指定日期在历史数据中的索引
+        target_position = int(all_dates.get_indexer([target_date])[0])
+        if target_position >= 0:
+            lookback_end = target_position
+            future_start_index = target_position
         else:
-            target_position = int(all_dates.get_indexer([target_date])[0])
-            if target_position >= 0:
-                future_start_index = target_position
-                lookback_end = future_start_index
-            else:
-                next_trade_date = pd.Timestamp(all_dates[-1] + pd.offsets.BDay(1))
-                if target_date != next_trade_date:
-                    raise ValueError(
-                        f'prediction_date={target_date.strftime("%Y%m%d")} 必须是数据中的交易日，'
-                        f'或最新数据之后的下一个交易日 {next_trade_date.strftime("%Y%m%d")}。'
-                    )
-                future_start_index = None
-                lookback_end = len(all_dates)
+            # 处理不在历史库中但逻辑上合理的下一个交易日
+            next_trade_date = pd.Timestamp(all_dates[-1] + pd.offsets.BDay(1))
+            if target_date != next_trade_date:
+                raise ValueError(f"指定的 prediction_date {target_date} 不在有效范围内。")
+            lookback_end = len(all_dates)
+            future_start_index = None
 
+        # 3. 设置切片索引
         lookback_start = lookback_end - self.seq_len
         label_start = lookback_end - self.label_len
+        
         if lookback_start < 0 or label_start < 0:
-            raise ValueError(
-                f'prediction_date={target_date.strftime("%Y%m%d")} 可用历史不足，'
-                f'至少需要 seq_len={self.seq_len}、label_len={self.label_len}。'
-            )
+            raise ValueError("可用历史交易日长度不足以构造输入序列。")
 
-        lookback_presence = all_presence[lookback_start:lookback_end]
-        self.code_indices = np.flatnonzero(lookback_presence.sum(axis=0) == self.seq_len)
-        if len(self.code_indices) == 0:
-            raise ValueError('pred 模式没有任何股票满足最近窗口的完整覆盖要求。')
+        # 4. 股票筛选
+        # presence_slice.all(axis=0) 确保在回溯窗口内每一天都有数据
+        presence_slice = all_presence[lookback_start:lookback_end]
+        valid_indices = np.flatnonzero(presence_slice.all(axis=0))
+        
+        if len(valid_indices) == 0:
+            raise ValueError("当前窗口内没有任何股票满足完整数据覆盖要求。")
 
-        self.code_indices = cap_stock_indices(self.code_indices, self.stock_cap, self.stock_sample_seed)
+        self.code_indices = valid_indices
         self.selected_codes = np.asarray(all_codes)[self.code_indices]
+        self.num_stock = len(self.code_indices)
 
-        self.num_stock = int(len(self.code_indices))
-        self.min_num_stock = self.num_stock
-        self.median_num_stock = self.num_stock
-        self.lookback_values = all_values[lookback_start:lookback_end, self.code_indices, :]
-        self.label_values = all_values[label_start:lookback_end, self.code_indices, :]
-        self.lookback_dates = all_dates[lookback_start:lookback_end]
-        self.label_dates = all_dates[label_start:lookback_end]
-        self.target_date = target_date
+        # 5. 时间标记 (Positional Encoding)
+        lookback_dates = all_dates[lookback_start:lookback_end]
+        future_dates = build_future_dates(all_dates, future_start_index, target_date, self.pred_len)
+        
+        x_mark = time_features(pd.to_datetime(lookback_dates), freq=self.freq).transpose(1, 0)
+        y_mark_dates = list(pd.to_datetime(all_dates[label_start:lookback_end])) + list(pd.to_datetime(future_dates))
+        y_mark = time_features(pd.to_datetime(y_mark_dates), freq=self.freq).transpose(1, 0)
 
-        # 未来时间戳用于解码器位置编码，标签值本身用 0 占位。
-        self.future_dates = build_future_dates(all_dates, future_start_index, target_date, self.pred_len)
-        y_mark_dates = list(pd.to_datetime(self.label_dates)) + list(pd.to_datetime(self.future_dates))
-        self.x_mark = time_features(pd.to_datetime(self.lookback_dates), freq=self.freq).transpose(1, 0)
-        self.y_mark = time_features(pd.to_datetime(y_mark_dates), freq=self.freq).transpose(1, 0)
+        # 6. 预先转换 Tensor（提升 __getitem__ 效率）
+        # 处理历史序列 X
+        raw_x = all_values[lookback_start:lookback_end, self.code_indices, :].transpose(1, 0, 2)
+        
+        # 处理带 Zero Padding 的 Y 序列
+        raw_y_label = all_values[label_start:lookback_end, self.code_indices, :].transpose(1, 0, 2)
+        seq_y_future_pad = np.zeros((self.num_stock, self.pred_len, raw_y_label.shape[2]), dtype=np.float32)
+        raw_y = np.concatenate([raw_y_label.astype(np.float32), seq_y_future_pad], axis=1)
+
+        # 打包为推理所需的最终形式
+        self.tensors = (
+            torch.tensor(raw_x, dtype=torch.float32),
+            torch.tensor(raw_y, dtype=torch.float32),
+            torch.tensor(np.tile(x_mark, (self.num_stock, 1, 1)), dtype=torch.float32),
+            torch.tensor(np.tile(y_mark, (self.num_stock, 1, 1)), dtype=torch.float32),
+            torch.ones(self.num_stock, dtype=torch.bool) # stock_mask
+        )
+        
+        self.trade_date = pd.Timestamp(lookback_dates[-1])
 
     def __getitem__(self, index):
         if index != 0:
-            raise IndexError("pred 数据集仅包含一个样本，索引必须为 0。")
-
-        seq_x = self.lookback_values.transpose(1, 0, 2)
-        seq_y_label = self.label_values.transpose(1, 0, 2)
-        seq_y_future_pad = np.zeros((self.num_stock, self.pred_len, seq_y_label.shape[2]), dtype=np.float32)
-        seq_y = np.concatenate([seq_y_label.astype(np.float32), seq_y_future_pad], axis=1)
-
-        seq_x_mark = np.tile(self.x_mark, (self.num_stock, 1, 1)).astype(np.float32)
-        seq_y_mark = np.tile(self.y_mark, (self.num_stock, 1, 1)).astype(np.float32)
-
-        seq_x = torch.tensor(seq_x.transpose(1, 0, 2), dtype=torch.float32)
-        seq_y = torch.tensor(seq_y, dtype=torch.float32)
-        seq_x_mark = torch.tensor(seq_x_mark, dtype=torch.float32)
-        seq_y_mark = torch.tensor(seq_y_mark, dtype=torch.float32)
-
-        stock_mask = torch.ones(self.num_stock, dtype=torch.bool)
-
-        return seq_x, seq_y, seq_x_mark, seq_y_mark, stock_mask
+            raise IndexError("预测数据集仅支持单 batch（索引必须为 0）。")
+        return self.tensors
 
     def __len__(self):
         return 1

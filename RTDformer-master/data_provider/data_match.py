@@ -52,7 +52,7 @@ def data_provider(args, flag, print_debug):
         Data = StockDataset
 
     ## data_set：输入数据类的实例，通过某些规则，返回分好批次的全部样本
-    data_set = Data(
+    data_kwargs = dict(
         root_path=args.root_path,
         data_path=args.data_path,
         flag=flag,
@@ -61,9 +61,13 @@ def data_provider(args, flag, print_debug):
         target=args.target,  #target='close'
         timeenc=timeenc,    #1
         freq=freq  ,     #d
-        stock_cap=stock_cap,
-        prediction_date=getattr(args, 'prediction_date', None) if flag == 'pred' else None,
     )
+    if flag == 'train':
+        data_kwargs['stock_cap'] = stock_cap
+    if flag == 'pred':
+        data_kwargs['prediction_date'] = getattr(args, 'prediction_date', None)
+
+    data_set = Data(**data_kwargs)
     args.num_stock = data_set.num_stock
     if getattr(data_set, 'dynamic_stock_pool', False):
         if args.model == 'StockMixer':

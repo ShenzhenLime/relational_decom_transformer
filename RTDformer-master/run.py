@@ -29,7 +29,7 @@ parser = argparse.ArgumentParser(
 )
 
 general_group = parser.add_argument_group('general')
-general_group.add_argument('--run', type=str, default="train", help='run mode: train, test, or train+test')
+general_group.add_argument('--run', type=str, default="train", help='run mode: train, test, or pred')
 general_group.add_argument('--model_id', type=str, default='test', help='experiment id prefix')
 general_group.add_argument('--model', type=str, default='3Dformer', choices=MODEL_CHOICES, help='model name')
 general_group.add_argument('--data', type=str, default='StockDataset', help='dataset name used in experiment tags')
@@ -202,7 +202,9 @@ if __name__ == '__main__':
     np.random.seed(fix_seed)
 
     temp_run_dir = None
-    persist_results = args.save and args.run != 'pred'
+
+    ## 结果保存（会依据时间生成一系列文件夹）：训练模式下默认开启，测试/预测模式默认关闭
+    persist_results = args.save and args.run == 'train'
     if persist_results:
         args = resolve_runtime_paths(args)
     else:
@@ -243,11 +245,7 @@ if __name__ == '__main__':
                 raise ValueError('pred 模式需要提供 --checkpoint_path。')
 
             exp = Exp(args)
-            exp.predict_factor_by_date(
-                prediction_date=args.prediction_date,
-                checkpoint_path=args.checkpoint_path,
-                step_index=args.factor_step_index,
-            )
+            exp.predict_factor_by_date(step_index=args.factor_step_index)
             empty_cache(args.device_type)
         else:
             raise ValueError(f'不支持的 run 模式: {args.run}')

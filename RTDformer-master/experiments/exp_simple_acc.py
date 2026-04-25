@@ -249,8 +249,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return pd.concat(factor_frames, ignore_index=True)
 
-    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor'):
+    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor', step_index=0):
         factor_frames = []
+        # 修复变量名错误 (dataset -> pred_data) 并增加空值校验
+        raw_date = getattr(pred_data, 'trade_date', None)
+        if raw_date is None:
+            raise AttributeError("pred_data 缺少 trade_date 属性，请检查数据加载逻辑。")
+        trade_date = pd.Timestamp(raw_date).strftime('%Y%m%d')
 
         self.model.eval()
         with torch.no_grad():
@@ -274,14 +279,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             f'pred 因子计算 chunk={chunk_index}',
                         )
                         sample_scores.append(
-                            self._extract_factor_scores(outputs).detach().cpu().numpy()
+                            self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
                         )
 
                 factor_frames.append(
                     pd.DataFrame(
                         {
                             'ts_code': pred_data.selected_codes,
-                            'trade_date': pd.Timestamp(pred_data.target_date).strftime('%Y%m%d'),
+                            'trade_date': trade_date,
                             factor_column: np.concatenate(sample_scores),
                         }
                     )
@@ -298,9 +303,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if repo_src.exists() and str(repo_src) not in sys.path:
             sys.path.insert(0, str(repo_src))
 
-    def _append_factor_to_db_if_missing(self, factor_df, table_name=FACTOR_TABLE_NAME):
+    def _append_factor_to_db_if_missing(self, factor_df, table_name=FACTOR_TABLE_NAME, factor_column='factor'):
         self._ensure_repo_src()
-        from quant_infra import db_utils
+        try:
+            from quant_infra import db_utils
+        except ImportError:
+            print("quant_infra not available, skipping DB save")
+            return
 
         trade_date = str(factor_df['trade_date'].iloc[0])
         conn = db_utils.init_db()
@@ -321,7 +330,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             self._print_stage('预测', f'{trade_date} 已存在于 {table_name}，跳过追加写入。')
             return False
 
-        db_utils.write_to_db(factor_df[['ts_code', 'trade_date', 'factor']], table_name, save_mode='append')
+        db_utils.write_to_db(factor_df[['ts_code', 'trade_date', factor_column]], table_name, save_mode='append')
         self._print_stage('预测', f'{trade_date} 已追加到因子表 {table_name}。')
         return True
 
@@ -375,10 +384,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             raise
 
     def _extract_target_labels(self, batch_y, as_int=False):
-        """从 batch_y 中提取目标标签：取预测区间、相对首日涨跌二分类"""
+        """从 batch_y 中提取目标标签：取预测区间、相对seq_len最后一日的涨跌二分类"""
+        if batch_y.shape[1] < self.args.pred_len + 1:
+            raise ValueError('当前标签定义要求 label_len 至少为 1，才能以前一交易日作为涨跌基准。')
+
         f_dim = -1 if self.args.features == 'MS' else 0
-        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+        batch_y = batch_y[:, -(self.args.pred_len + 1):, f_dim:].to(self.device)
         batch_y = batch_y - batch_y[:, :1, :]
+        batch_y = batch_y[:, 1:, :]
         return (batch_y > 0).int() if as_int else (batch_y > 0).float()
 
     def _prepare_batch(self, batch):
@@ -748,38 +761,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def predict_factor_by_date(
         self,
-        prediction_date,
-        checkpoint_path=None,
         table_name=FACTOR_TABLE_NAME,
         factor_column='factor',
-        append_if_missing=True,
         step_index=0,
     ):
-        resolved_checkpoint_path = checkpoint_path or getattr(self, 'best_model_file', None)
-        if not resolved_checkpoint_path:
-            raise ValueError('predict_factor_by_date 需要提供 checkpoint_path 或先完成训练。')
-
-        self.args.prediction_date = prediction_date
-        self.model.load_state_dict(load_checkpoint(resolved_checkpoint_path, self.device))
+        self.model.load_state_dict(load_checkpoint(self.args.checkpoint_path, self.device))
         pred_data, pred_loader = self._get_data(flag='pred')
         result = self._collect_prediction_factor_frame(
             pred_data,
             pred_loader,
             factor_column=factor_column,
+            step_index=step_index,
         )
         if result.empty:
-            raise RuntimeError(f'prediction_date={prediction_date} 未生成任何因子值。')
+            raise RuntimeError(f'prediction_date={self.args.prediction_date} 未生成任何因子值。')
 
-        if factor_column != 'factor':
-            db_ready = result.rename(columns={factor_column: 'factor'})
-        else:
-            db_ready = result.copy()
+        self._append_factor_to_db_if_missing(result, table_name=table_name, factor_column=factor_column)
 
-        if append_if_missing:
-            self._append_factor_to_db_if_missing(db_ready, table_name=table_name)
-
-        self._print_stage(
-            '预测',
-            f'prediction_date={prediction_date} 因子计算完成，共 {len(result)} 条。'
-        )
+        self._print_stage('预测', f'prediction_date={self.args.prediction_date} 因子计算完成，共 {len(result)} 条。')
         return result

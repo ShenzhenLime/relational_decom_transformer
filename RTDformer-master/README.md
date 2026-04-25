@@ -113,7 +113,7 @@ RTDformer-master/
 
 - build_dense_cache()
 - build_window_code_indices()
-- cap_stock_indices()
+- select_train_stock_indices()
 - dynamic_stock_collate()
 - Exp_Long_Term_Forecast._prepare_batch()
 

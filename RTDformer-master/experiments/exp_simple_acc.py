@@ -47,13 +47,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super().__init__(args)
         self.print_debug = False
-        if self.args.model == 'RTDformer2' and self.args.device_type == 'cuda' and self.args.use_amp:
-            self.args.use_amp = False
-            self._print_stage('设备', '检测到 RTDformer2 在 CUDA AMP 下存在数值不稳定，已自动关闭 AMP 以避免 NaN。')
-
-    @staticmethod
-    def _finite_ratio(tensor):
-        return torch.isfinite(tensor).float().mean().item()
 
     @staticmethod
     def _format_metric(value):
@@ -123,7 +116,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             self.args.args_json_path,
             {
                 **vars(self.args),
-                'setting': setting,
             },
         )
         self._append_output(
@@ -316,6 +308,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if torch.isfinite(tensor).all():
             return
 
+        ## 计算非有限值比例、最小值和最大值，帮助诊断问题
         detached = tensor.detach().float()
         finite_mask = torch.isfinite(detached)
         finite_values = detached[finite_mask]
@@ -323,7 +316,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         max_value = float(finite_values.max().item()) if finite_values.numel() else float('nan')
         raise RuntimeError(
             f'{name} 出现非有限值 | shape={tuple(detached.shape)} | '
-            f'finite_ratio={self._finite_ratio(detached):.6f} | min={min_value:.6f} | max={max_value:.6f}'
+            f'finite_ratio={finite_mask.float().mean().item():.6f} | min={min_value:.6f} | max={max_value:.6f}'
         )
 
     def _forward(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, stage_name):
@@ -334,7 +327,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             with ctx:
                 result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 outputs = result[0] if self.args.output_attention else result
-            self._ensure_finite(f'{stage_name} 模型输出', outputs)
+            self._ensure_finite(f'{stage_name} 的模型输出', outputs)
             return outputs
         except torch.OutOfMemoryError:
             manage_device_memory(self.args.device_type, force_gc=True)
@@ -569,8 +562,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             self._append_output(
                 'epoch_complete',
                 {
-                    'setting': setting,
                     'epoch': epoch + 1,
+                    'learning_rate': model_optim.param_groups[0]['lr'],
                     'temp_checkpoint_path': temp_checkpoint_path,
                     'best_model_file': early_stopping.best_model_file,
                     'train_loss': train_loss,
@@ -589,8 +582,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             if early_stopping.early_stop:
                 self._print_stage('训练', '触发提前停止，结束后续轮次。')
                 break
-                        # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
             
+            # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
             # 5. 重新实例化优化器并加载状态
             model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
             model_optim.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -602,10 +595,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self._print_stage('训练', f'加载验证集表现最优的模型参数: {self.best_model_file}')
         self._append_output(
             'train_complete',
-            {
-                'best_model_file': self.best_model_file,
-                'setting': setting,
-            },
+            {'best_model_file': self.best_model_file}
         )
 
         self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
@@ -672,7 +662,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self._append_output(
             'test_metrics',
             {
-                'setting': setting,
                 'best_model_file': getattr(self, 'best_model_file', None),
                 **metrics,
             },

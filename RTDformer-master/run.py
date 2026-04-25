@@ -86,7 +86,8 @@ optimization_group.add_argument('--batch_size', type=int, default=400, help='tra
 optimization_group.add_argument('--patience', type=int, default=3, help='early stopping patience')
 optimization_group.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
 optimization_group.add_argument('--lradj', type=str, default='type1', help='learning rate schedule type')
-add_bool_arg(optimization_group, '--use_amp', True, 'enable CUDA automatic mixed precision')
+## 模型的精度会有问题，导致Loss为NaN
+add_bool_arg(optimization_group, '--use_amp', False, 'enable CUDA automatic mixed precision')
 
 device_group = parser.add_argument_group('device')
 add_bool_arg(device_group, '--use_gpu', True, 'request accelerator when available')

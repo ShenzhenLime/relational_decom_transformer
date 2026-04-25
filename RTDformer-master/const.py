@@ -10,7 +10,7 @@ ARTIFACTS_ROOT = 'results'
 CLOUD_BUNDLE_DIR = 'deploy/rtdformer2_cloud'
 CLOUD_BUNDLE_ARCHIVE_PATH = f'{CLOUD_BUNDLE_DIR}.zip'
 
-FACTOR_OUTPUT_PATH = 'valid_test_factor.parquet'
+FACTOR_OUTPUT_FILE = 'valid_test_factor.parquet'
 FACTOR_TABLE_NAME = '3Dformer'
 
 RTDFORMER2_CLOUD_BUNDLE_FILES = (

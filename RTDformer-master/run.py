@@ -14,7 +14,7 @@ prepare_torch_runtime()
 import torch
 
 from experiments.exp_simple_acc import Exp_Long_Term_Forecast
-from const import ARTIFACTS_ROOT, DATA_PATH, FACTOR_OUTPUT_PATH
+from const import ARTIFACTS_ROOT, DATA_PATH, FACTOR_OUTPUT_FILE
 
 MODEL_CHOICES = ['FourierGNN', 'Transformer', 'TDformer', 'Informer', 'Wformer', 'iTransformer', 'RTDformer2', '3DDformer', 'FEDformer', 'PDF', 'StockMixer', 'DLinear']
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -137,7 +137,7 @@ def resolve_runtime_paths(args, run_dir=None):
     args.args_json_path = str(run_path / 'args.json')
     args.output_json_path = str(run_path / 'output.json')
     args.tensorboard_dir = str(run_path / 'tensorboard')
-    args.factor_output_path = str(run_path / FACTOR_OUTPUT_PATH)
+    args.factor_output_path = str(run_path / FACTOR_OUTPUT_FILE)
     return args
 
 

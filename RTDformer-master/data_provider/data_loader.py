@@ -11,185 +11,162 @@ from const import *
 import pathlib as path
 
 def load_pt_dataframe(pt_path):
+    """
+    从 .pt 文件加载 Pandas 数据表。
+    支持直接保存的 DataFrame 或带 'data' 键的字典。
+    """
     raw = torch.load(pt_path, weights_only=False)
-    if isinstance(raw, dict) and 'data' in raw:
-        raw = raw['data']
+    # 如果数据被包装在字典里，则取出它
+    if isinstance(raw, dict):
+        raw = raw.get('data', raw)
     if not isinstance(raw, pd.DataFrame):
-        raise TypeError(f'不支持的 .pt 数据格式: {type(raw)}')
+        raise TypeError(f'数据格式错误: 期望 DataFrame，实际得到 {type(raw)}')
     return raw
 
-
-def resolve_dataset_path(root_path, data_path):
-    data_file = path.Path(data_path)
-    if data_file.is_absolute():
-        return data_file
-    return path.Path(root_path) / data_file
-
-
 def require_prepared_dataset(root_path, data_path):
-    pt_path = resolve_dataset_path(root_path, data_path)
-    if not pt_path.exists():
-        raise FileNotFoundError(
-            f'未找到数据文件: {pt_path}\n'
-            '云端训练不再自动导出数据。请先在本地执行 tools/prepare_local_data.py 生成 .pt 文件，'
-            '再将该文件上传到云端。'
-        )
-    return pt_path
+    """
+    检查并定位数据文件。如果文件不存在，给出友好的报错提示。
+    合并了路径解析逻辑，减少函数跳转。
+    """
+    full_path = path.Path(data_path)
+    if not full_path.is_absolute():
+        full_path = path.Path(root_path) / data_path
+    
+    if not full_path.exists():
+        raise FileNotFoundError(f'未找到数据文件: {full_path}\n请先在本地生成 .pt 文件并上传。')
+    return full_path
 
 def build_future_dates(all_dates, start_index, start_date, pred_len):
     """
-    构建未来日期索引
-    :param all_dates: 所有日期
-    :param start_index: 起始索引
-    :param start_date: 起始日期
-    :param pred_len: 预测长度
-    :return: 预测日期索引
+    构建未来预测时段的日期索引。
+    如果历史库里有存量日期就直接用，不够的部分用‘工作日’自动补齐。
     """
-    observed_dates = []
+    # 尝试从现有日期库中截取
+    found = []
     if start_index is not None and 0 <= start_index < len(all_dates):
-        observed_dates = list(all_dates[start_index:min(start_index + pred_len, len(all_dates))])
+        found = list(all_dates[start_index : start_index + pred_len])
 
-    if len(observed_dates) == pred_len:
-        return pd.DatetimeIndex(observed_dates)
-
-    extension_start = observed_dates[-1] + pd.offsets.BDay(1) if observed_dates else start_date
-    extension_dates = list(pd.bdate_range(extension_start, periods=pred_len - len(observed_dates)))
-    return pd.DatetimeIndex(observed_dates + extension_dates)
-
+    # 如果截取的长度不够（说明到了数据末尾），则向后延伸工作日
+    missing = pred_len - len(found)
+    if missing > 0:
+        base_date = found[-1] if found else start_date
+        ext = pd.bdate_range(base_date + pd.offsets.BDay(1), periods=missing)
+        found.extend(list(ext))
+        
+    return pd.DatetimeIndex(found)
 
 def build_dense_cache(pt_path, target, cache_store):
+    """
+    核心预处理：将“窄长”的表格转换为“宽厚”的三维矩阵 (时间, 股票, 特征)。
+    这样做可以极大地加速后续的切片速度。
+    """
     cache_key = str(path.Path(pt_path).resolve())
     if cache_key in cache_store:
         return cache_store[cache_key]
 
-    df_raw = load_pt_dataframe(pt_path)
+    df = load_pt_dataframe(pt_path)
+    
+    # 确保目标列（target）排在最后，方便索引
+    cols = [c for c in df.columns if c != target] + [target]
+    df = df[cols]
 
-    cols = list(df_raw.columns)
-    cols.remove(target)
-    df_raw = df_raw[cols + [target]]
+    # 利用 factorize 将日期和代码映射为连续的数字坐标
+    row_dates = df.index.get_level_values('date')
+    row_codes = df.index.get_level_values('code')
+    date_idx, u_dates = pd.factorize(row_dates, sort=True)
+    code_idx, u_codes = pd.factorize(row_codes, sort=True)
 
-    row_dates = pd.DatetimeIndex(df_raw.index.get_level_values('date'))
-    row_codes = pd.Index(df_raw.index.get_level_values('code'))
-    date_positions, unique_dates = pd.factorize(row_dates, sort=True)
-    code_positions, unique_codes = pd.factorize(row_codes, sort=True)
+    # 创建空矩阵并填入数据
+    dense = np.full((len(u_dates), len(u_codes), len(cols)), np.nan, dtype=np.float32)
+    dense[date_idx, code_idx] = df.to_numpy()
 
-    values_2d = df_raw.to_numpy(dtype=np.float32, copy=True)
-    dense_values = np.full(
-        (len(unique_dates), len(unique_codes), values_2d.shape[1]),
-        np.nan,
-        dtype=np.float32,
-    )
-    dense_values[date_positions, code_positions] = values_2d
-    presence = ~np.isnan(dense_values).any(axis=2)
-    history_days = np.cumsum(presence.astype(np.int32, copy=False), axis=0, dtype=np.int32)
-    date_counts = presence.sum(axis=1)
-
+    # 预计算一些辅助信息，避免在 Dataset 里重复算
+    presence = ~np.isnan(dense).any(axis=2) # 标记哪些位置有数据
+    
     cache_store[cache_key] = {
-        'values': dense_values,
+        'values': dense,
         'presence': presence,
-        'history_days': history_days,
-        'dates': pd.DatetimeIndex(unique_dates),
-        'codes': np.asarray(unique_codes),
-        'columns': list(df_raw.columns),
-        'close_col_index': int(df_raw.columns.get_loc('close')),
-        'legacy_fixed_pool': bool(date_counts.min() == date_counts.max()),
+        'history_days': np.cumsum(presence, axis=0), # 每只股票截止到当天的上市天数
+        'dates': pd.DatetimeIndex(u_dates),
+        'codes': np.asarray(u_codes),
+        'close_col_index': int(df.columns.get_loc('close')),
+        'legacy_fixed_pool': bool(presence.sum(axis=1).min() == presence.sum(axis=1).max())
     }
     return cache_store[cache_key]
 
-
 def build_window_code_indices(presence, required_window):
-    if presence.shape[0] < required_window:
-        return []
-
-    presence_int = presence.astype(np.int32, copy=False)
-    cumsum = np.cumsum(presence_int, axis=0, dtype=np.int32)
-    window_sums = cumsum[required_window - 1:].copy()
-    if required_window > 1:
-        window_sums[1:] -= cumsum[:-required_window]
-    return [np.flatnonzero(row == required_window) for row in window_sums]
-
+    """
+    算法：利用累加和(cumsum)的差值，快速找出哪些股票在连续的窗口内都有数据。
+    原理：如果一个窗口长度是 10，那么窗口末尾的累加和减去窗口开头的累加和如果等于 10，说明中间没有断档。
+    """
+    if len(presence) < required_window: return []
+    
+    cumsum = np.cumsum(presence.astype(np.int32), axis=0)
+    # 计算滑动窗口内的有效天数
+    v_sums = cumsum[required_window-1:].copy()
+    v_sums[1:] -= cumsum[:-required_window]
+    
+    # 找出每一天里，哪些股票的有效天数正好等于窗口长度
+    return [np.flatnonzero(row == required_window) for row in v_sums]
 
 def select_train_stock_indices(split_values, history_days, code_indices, window_start,
                                seq_len, pred_len, stock_cap, close_col_index,
-                               min_history_days=400, trim_ratio=0.01):
-    if len(code_indices) == 0:
-        return code_indices
+                               min_history_days=MIN_HISTORY_DAYS, trim_ratio=JIE_WEI_RATIO):
+    """
+    训练集专用筛选器：通过回测收益率和上市时长，精选出一部分股票进行训练。
+    """
+    # 1. 过滤掉“新股”（上市时间不足的）
+    pred_start = window_start + seq_len
+    mask = history_days[pred_start, code_indices] > min_history_days
+    indices = code_indices[mask]
+    if len(indices) == 0: return indices
 
-    prediction_start = window_start + seq_len
-    eligible_history_mask = history_days[prediction_start, code_indices] > min_history_days
-    eligible_code_indices = code_indices[eligible_history_mask]
-    if len(eligible_code_indices) == 0:
-        return eligible_code_indices
+    # 2. 计算预测时段的真实收益率(相对于预测期的前一天) (用于排序和筛选)
+    f_close = split_values[pred_start - 1 : pred_start + pred_len, indices, close_col_index]
+    returns = (f_close[-1] / f_close[0]) - 1.0
+    
+    # 剔除无效值 (NaN 或 0)
+    valid = np.isfinite(returns) & (f_close[0] != 0)
+    indices, returns = indices[valid], returns[valid]
 
-    future_close = split_values[
-        prediction_start:prediction_start + pred_len,
-        eligible_code_indices,
-        close_col_index,
-    ]
-    base_close = future_close[0]
-    last_close = future_close[-1]
-    valid_return_mask = np.isfinite(base_close) & np.isfinite(last_close) & (base_close != 0)
-    eligible_code_indices = eligible_code_indices[valid_return_mask]
-    if len(eligible_code_indices) == 0:
-        return eligible_code_indices
+    # 3. 排序并剔除极端的 1% (异常波动)
+    order = np.argsort(returns)
+    indices, returns = indices[order], returns[order]
+    trim = int(len(indices) * trim_ratio)
+    if trim > 0:
+        indices, returns = indices[trim:-trim], returns[trim:-trim]
 
-    acc_pred_ret = (last_close[valid_return_mask] / base_close[valid_return_mask]) - 1.0
-    order = np.argsort(acc_pred_ret, kind='stable')
-    sorted_code_indices = eligible_code_indices[order]
-    sorted_returns = acc_pred_ret[order]
+    # 4. 均衡采样：选取表现最好和最差的两部分，保证模型见过“涨”也见过“跌”
+    down_pool = indices[returns <= 0]
+    up_pool = indices[returns > 0]
+    
+    # 确定每类选多少只
+    limit = len(indices) // 2 if stock_cap is None else stock_cap // 2
+    count = min(limit, len(down_pool), len(up_pool))
+    
+    if count <= 0: return np.array([], dtype=int)
 
-    trim_count = int(len(sorted_code_indices) * trim_ratio)
-    if trim_count > 0:
-        sorted_code_indices = sorted_code_indices[trim_count:-trim_count]
-        sorted_returns = sorted_returns[trim_count:-trim_count]
-
-    if len(sorted_code_indices) == 0:
-        return np.array([], dtype=code_indices.dtype)
-
-    down_code_indices = sorted_code_indices[sorted_returns <= 0]
-    up_code_indices = sorted_code_indices[sorted_returns > 0]
-
-    half_by_pool = len(sorted_code_indices) // 2
-    half_by_cap = half_by_pool if stock_cap is None else stock_cap // 2
-    per_class_count = min(half_by_pool, half_by_cap, len(down_code_indices), len(up_code_indices))
-    if per_class_count <= 0:
-        return np.array([], dtype=code_indices.dtype)
-
-    selected_code_indices = np.concatenate([
-        down_code_indices[:per_class_count],
-        up_code_indices[-per_class_count:],
-    ])
-    selected_code_indices.sort()
-    return selected_code_indices
+    # 合并结果：取最差的前 count 个和最好的后 count 个
+    final_selection = np.concatenate([down_pool[:count], up_pool[-count:]])
+    return np.sort(final_selection)
 
 class StockDataset(Dataset):
     _data_cache = {}
 
     def __init__(self, root_path, data_path, flag='train', size=None,
-                 features='S', target='close', scale=True, timeenc=0, freq='h', print_debug=False,
-                 stock_cap=None, prediction_date=None):
-        
-        self.seq_len = size[0]
-        self.label_len = size[1]
-        self.pred_len = size[2]
-        
-        
-        assert flag in ['train', 'test', 'val']
-        type_map = {'train': 0, 'val': 1, 'test': 2}
-        self.set_type = type_map[flag]
-        self.num_stock = None
-        self.features = features
+                 features='S', target='close', scale=True, timeenc=0, freq='h', 
+                 stock_cap=None, **kwargs):
+        # 初始化参数
+        self.seq_len, self.label_len, self.pred_len = size
+        self.set_type = {'train': 0, 'val': 1, 'test': 2}[flag]
         self.target = target
-        self.scale = scale
-        self.timeenc = timeenc
-        self.freq = freq
-        
-        self.print_debug = print_debug 
-        self.dynamic_stock_pool = True
         self.stock_cap = stock_cap
+        self.freq = freq
 
         self.root_path = root_path
         self.data_path = data_path
+        
+        # 执行数据读取与初始化
         self.__read_data__()
 
     def __read_data__(self):
@@ -199,132 +176,83 @@ class StockDataset(Dataset):
         pt_path = require_prepared_dataset(self.root_path, self.data_path)
         cache = build_dense_cache(pt_path, self.target, self._data_cache)
 
+        # 1. 基础数据映射
         self.all_values = cache['values']
-        self.all_presence = cache['presence']
-        self.all_history_days = cache['history_days']
         self.all_dates = cache['dates']
-        self.all_codes = cache['codes']
         self.close_col_index = cache['close_col_index']
-        self.total_num_stock = int(len(self.all_codes))
         
-        # 训练/验证集日期边界（包含该日期）
-        train_end_date = pd.Timestamp(TRAIN_END_DATE)
-        vali_end_date = pd.Timestamp(VALID_END_DATE)
+        # 2. 确定日期切分边界 (简化索引定位逻辑)
+        # 寻找训练集和验证集在时间轴上的终点位置
+        train_end_idx = np.searchsorted(self.all_dates, pd.Timestamp(TRAIN_END_DATE), side='right')
+        vali_end_idx = np.searchsorted(self.all_dates, pd.Timestamp(VALID_END_DATE), side='right')
 
-        if self.all_dates[0] > train_end_date:
-            raise ValueError(f"训练截止日 {train_end_date.date()} 早于数据起始日 {self.all_dates[0].date()}。")
-        if self.all_dates[0] > vali_end_date:
-            raise ValueError(f"验证截止日 {vali_end_date.date()} 早于数据起始日 {self.all_dates[0].date()}。")
+        # 不同数据集切分的起止边界（左闭右开）
+        starts = [0, train_end_idx - self.seq_len, vali_end_idx - self.seq_len]
+        ends = [train_end_idx, vali_end_idx, len(self.all_dates)]
         
-        # 将日期边界转换为在 unique_dates 中的索引上界（右开区间的结束位置）
-        num_train = int(np.searchsorted(self.all_dates, train_end_date, side='right'))
-        num_vali = int(np.searchsorted(self.all_dates, vali_end_date, side='right'))
+        s_idx, e_idx = starts[self.set_type], ends[self.set_type]
+        
+        # 3. 提取对应时间段的数据
+        self.split_values = self.all_values[s_idx:e_idx]
+        selected_dates = self.all_dates[s_idx:e_idx]
+        # 时间特征编码 (用于给模型提供时间感)
+        self.data_stamp = time_features(pd.to_datetime(selected_dates), freq=self.freq).transpose(1, 0)
 
-        if num_train <= self.seq_len:
-            raise ValueError(f"训练区间交易日不足：至少需要大于 seq_len={self.seq_len}，实际仅有 {num_train} 天。")
-        if num_vali <= self.seq_len:
-            raise ValueError(f"验证区间交易日不足：至少需要大于 seq_len={self.seq_len}，实际仅有 {num_vali} 天。")
-        if num_vali <= num_train:
-            raise ValueError(f"验证截止日 {vali_end_date.date()} 未晚于训练截止日 {train_end_date.date()}。")
-
-        # 不同数据集切分的起止边界（按日期索引，左闭右开）
-        split_start_candidates = [0, num_train - self.seq_len, num_vali - self.seq_len]
-        split_end_candidates = [num_train, num_vali, len(self.all_dates)]
-
-        split_start = split_start_candidates[self.set_type]
-        split_end = split_end_candidates[self.set_type]
-
-        self.split_values = self.all_values[split_start:split_end]
-        self.split_presence = self.all_presence[split_start:split_end]
-        self.split_history_days = self.all_history_days[split_start:split_end]
-        self.selected_dates = self.all_dates[split_start:split_end]
-
+        # 4. 构建样本索引库 (核心简化点：将所有样本信息打包进 self.samples)
         required_window = self.seq_len + self.pred_len
-        if len(self.selected_dates) < required_window:
-            raise ValueError(
-                f"split={self.set_type} 的交易日不足：至少需要 {required_window} 天，实际仅有 {len(self.selected_dates)} 天。"
-            )
-
-        self.data_stamp = time_features(pd.to_datetime(self.selected_dates), freq=self.freq).transpose(1, 0)
-
-        sample_code_indices = build_window_code_indices(self.split_presence, required_window)
-        sample_stock_counts = np.array([len(indices) for indices in sample_code_indices], dtype=np.int32)
-        valid_sample_mask = sample_stock_counts > 0
-        if not valid_sample_mask.any():
-            raise ValueError(f"split={self.set_type} 没有任何窗口满足动态股票池的最小覆盖要求。")
-
-        self.sample_window_starts = np.flatnonzero(valid_sample_mask)
-        self.raw_sample_stock_counts = sample_stock_counts[valid_sample_mask]
-        uncapped_code_indices = [sample_code_indices[idx] for idx in self.sample_window_starts]
-        if self.set_type == 0:
-            filtered_code_indices = [
-                select_train_stock_indices(
-                    self.split_values,
-                    self.split_history_days,
-                    indices,
-                    int(window_start),
-                    self.seq_len,
-                    self.pred_len,
-                    self.stock_cap,
-                    self.close_col_index,
-                )
-                for indices, window_start in zip(uncapped_code_indices, self.sample_window_starts)
-            ]
-        else:
-            filtered_code_indices = uncapped_code_indices
-
-        filtered_sample_mask = np.array([len(indices) > 0 for indices in filtered_code_indices], dtype=bool)
-        if not filtered_sample_mask.any():
-            raise ValueError(f"split={self.set_type} 在训练选股筛选后没有任何可用窗口。")
-
-        self.sample_window_starts = self.sample_window_starts[filtered_sample_mask]
-        self.raw_sample_stock_counts = self.raw_sample_stock_counts[filtered_sample_mask]
-        self.sample_code_indices = [
-            filtered_code_indices[idx]
-            for idx, keep in enumerate(filtered_sample_mask)
-            if keep
-        ]
-        self.sample_stock_counts = np.array([len(indices) for indices in self.sample_code_indices], dtype=np.int32)
-        self.dropped_sample_count = int((~filtered_sample_mask).sum())
-
-        self.num_stock = int(self.sample_stock_counts.max())
-        self.min_num_stock = int(self.sample_stock_counts.min())
-        self.median_num_stock = int(np.median(self.sample_stock_counts))
-        self.raw_max_num_stock = int(self.raw_sample_stock_counts.max())
-        self.legacy_fixed_pool = cache['legacy_fixed_pool']
+        # 获取每一天满足连续窗口条件的股票索引
+        raw_indices = build_window_code_indices(cache['presence'][s_idx:e_idx], required_window)
         
+        self.samples = []
+        for i, codes in enumerate(raw_indices):
+            if len(codes) == 0: continue
+            
+            # 如果是训练集，执行更严格的“选股筛选”（如排除新股、剔除极端收益率）
+            if self.set_type == 0:
+                codes = select_train_stock_indices(
+                    self.split_values, cache['history_days'][s_idx:e_idx], codes, 
+                    i, self.seq_len, self.pred_len, self.stock_cap, self.close_col_index
+                )
+            
+            # 如果筛选后还有股票，则记录这个“窗口日期”和对应的“股票集合”
+            if len(codes) > 0:
+                self.samples.append({'start': i, 'codes': codes})
+
+        if not self.samples:
+            raise ValueError(f"该数据集切片 ({self.set_type}) 下没有可用的股票样本。")
+
     def __getitem__(self, index):
         """
         给定一个索引 index，从原始的长表中抠出一块包含“历史数据”和“未来预测目标”的三维数据块（Tensor）。
         """
-        lookback_start = int(self.sample_window_starts[index])
-        lookback_end = lookback_start + self.seq_len
-        predict_start = lookback_end - self.label_len
-        predict_end = lookback_end + self.pred_len
-        code_indices = self.sample_code_indices[index]
-        num_codes = len(code_indices)
+        sample = self.samples[index]
+        s_begin = sample['start']
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = s_end + self.pred_len
+        codes = sample['codes']
+        num_codes = len(codes)
 
-        seq_x = self.split_values[lookback_start:lookback_end, code_indices, :].transpose(1, 0, 2)
-        seq_y = self.split_values[predict_start:predict_end, code_indices, :].transpose(1, 0, 2)
+        # 1. 提取数值序列：[股票数量, 时间长度, 特征数量]
+        seq_x = self.split_values[s_begin:s_end, codes, :].transpose(1, 0, 2)
+        seq_y = self.split_values[r_begin:r_end, codes, :].transpose(1, 0, 2)
+        
+        # 2. 构造时间标记序列
+        # 因为所有股票共享同一天的时间特征，所以需要进行 tile (平铺) 复制
+        x_mark = np.tile(self.data_stamp[s_begin:s_end], (num_codes, 1, 1))
+        y_mark = np.tile(self.data_stamp[r_begin:r_end], (num_codes, 1, 1))
 
-        seq_x_mark = np.tile(self.data_stamp[lookback_start:lookback_end], (num_codes, 1, 1))
-        seq_y_mark = np.tile(self.data_stamp[predict_start:predict_end], (num_codes, 1, 1))
+        # 3. 转换为 PyTorch 张量 (使用 from_numpy 比 tensor() 更高效，能共享内存)
+        return (torch.from_numpy(seq_x), torch.from_numpy(seq_y), 
+                torch.from_numpy(x_mark), torch.from_numpy(y_mark),
+                torch.ones(num_codes, dtype=torch.bool)) # stock_mask
 
-        seq_x = torch.tensor(seq_x, dtype=torch.float32)
-        seq_y = torch.tensor(seq_y, dtype=torch.float32)
-        seq_x_mark = torch.tensor(seq_x_mark, dtype=torch.float32)
-        seq_y_mark = torch.tensor(seq_y_mark, dtype=torch.float32)
-
-        stock_mask = torch.ones(num_codes, dtype=torch.bool)
-
-        return seq_x, seq_y, seq_x_mark, seq_y_mark, stock_mask
-    
     def __len__(self):
         """
         在这个数据集中，一共可以切出多少个“样本”（训练例子）。
         每次epoch需要遍历多少次 __getitem__() 才能把整个数据集都用一遍。
         """
-        return len(self.sample_window_starts)
+        return len(self.samples)
 
 
 class StockDataset_pred_long(Dataset):

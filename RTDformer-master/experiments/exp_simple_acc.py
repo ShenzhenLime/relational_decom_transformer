@@ -133,7 +133,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self._print_stage('训练', f'可通过 tensorboard --logdir "{log_dir}" 查看学习曲线。')
         return self._visual_writer
 
-    def _log_loss_curves(self, epoch, train_loss, vali_loss, test_loss):
+    def _log_loss_curves(self, epoch, train_loss, vali_loss):
         writer = self._get_visual_writer()
         if writer is None:
             return
@@ -141,7 +141,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         global_step = int(epoch)
         writer.add_scalar('loss/train', float(train_loss), global_step)
         writer.add_scalar('loss/val', float(vali_loss), global_step)
-        writer.add_scalar('loss/test', float(test_loss), global_step)
         writer.flush()
 
     def _close_visual_writer(self):
@@ -168,6 +167,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             },
         )
         return self.args.run_dir
+
+    def _clone_to_cpu(self, value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: self._clone_to_cpu(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._clone_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._clone_to_cpu(item) for item in value)
+        return value
+
+    def _capture_resume_state(self, model_optim):
+        return {
+            'model_state_dict': self._clone_to_cpu(self.model.state_dict()),
+            'optimizer_state_dict': self._clone_to_cpu(model_optim.state_dict()),
+        }
+
+    def _move_optimizer_state_to_device(self, optimizer):
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(self.device)
 
     def _get_factor_export_data(self, flag):
         data_set, _ = self._get_data(flag=flag)
@@ -433,7 +455,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             return
 
         if chunk_size is None:
-            chunk_size = self.args.dynamic_stock_cap
+            chunk_size = int(getattr(self.args, 'local_chunk_size', 0) or 0)
+
+        if chunk_size <= 0 or chunk_size >= num_stocks:
+            yield sample_x, sample_y, sample_x_mark, sample_y_mark
+            return
 
         for start in range(0, num_stocks, chunk_size):
             end = min(start + chunk_size, num_stocks)
@@ -450,9 +476,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = []
         trues = []
         stage_name = '验证'
+        total_batches = len(vali_loader)
+        self._print_stage(stage_name, f'开始执行，共 {total_batches} 个 batch。')
 
         with torch.no_grad():
-            for i, batch in enumerate(vali_loader):
+            vali_pbar = tqdm(
+                vali_loader,
+                desc=stage_name,
+                dynamic_ncols=True,
+                mininterval=10,
+            )
+            for i, batch in enumerate(vali_pbar):
                 prepared_batch = self._prepare_batch(batch)
                 batch_outputs = []
                 batch_targets = []
@@ -486,6 +520,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 trues.append(batch_y.detach().cpu())
                 total_loss.append(batch_loss.item())
 
+                vali_pbar.set_postfix({'loss': f'{batch_loss.item():.6f}'})
+
                 if self._should_cleanup_after_batch(i):
                     manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
@@ -493,6 +529,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         total_loss = np.average(total_loss)
         self.model.train()
         manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
+        self._print_stage(stage_name, '执行完成。')
 
         return total_loss, acc, auc, recall, f1
 
@@ -506,7 +543,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         path = self.args.checkpoint_dir
         os.makedirs(path, exist_ok=True)
-        temp_checkpoint_path = os.path.join(path, 'temp_epoch_end.pt')
 
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
@@ -529,7 +565,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     train_loader,
                     desc=f'Epoch [{epoch + 1}/{self.args.train_epochs}]',
                     dynamic_ncols=True,
-                    mininterval=60, # 60s
+                    mininterval=5, # 60s
                 )
                 for i, batch in enumerate(batch_pbar):
                     model_optim.zero_grad()
@@ -572,12 +608,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         batch_pbar.set_postfix({'max_mem': f'{max_allocated_gib:.2f}GiB'})
 
                 train_loss = np.average(train_loss)
-                # 1. 保存当前状态（包含优化器，否则无法继续训练）
-                state = {
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': model_optim.state_dict(),
-                }
-                torch.save(state, temp_checkpoint_path)
+                # 1. 将恢复训练所需状态转存到 CPU，避免验证前重新把优化器状态压回设备显存
+                self._print_stage('训练', '训练轮结束，开始转存当前模型与优化器状态到 CPU。')
+                resume_state = self._capture_resume_state(model_optim)
 
                 # 2. 彻底销毁对象并回收显存
                 # 注意：优化器占用的显存通常是模型的 2-3 倍（Adam 记录了动量等信息）
@@ -586,14 +619,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 manage_device_memory(self.args.device_type, force_gc=True)
 
                 # 3. 重新构建模型进行验证
+                self._print_stage('训练', '开始重建模型，并恢复参数用于验证。')
                 self.model = self._build_model().to(self.device)
-                checkpoint = torch.load(temp_checkpoint_path, map_location=self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.load_state_dict(resume_state['model_state_dict'])
 
                 # 4. 执行验证和测试
                 # 此时显存中只有模型，没有优化器的状态，空间更充裕
+                self._print_stage('训练', '开始验证集评估。')
                 vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
-                test_loss, test_acc, test_auc, test_recall, test_F1 = self.vali(test_data, test_loader, criterion)
 
                 epoch_duration = time.time() - epoch_time
                 last_loss = loss.item()
@@ -606,12 +639,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     )
                 )
                 self._print_metric_block('验证', vali_loss, vali_acc, vali_auc, vali_recall, vali_F1)
-                self._print_metric_block('测试', test_loss, test_acc, test_auc, test_recall, test_F1)
                 self._log_loss_curves(
                     epoch=epoch + 1,
                     train_loss=train_loss,
                     vali_loss=vali_loss,
-                    test_loss=test_loss,
                 )
                 manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
@@ -626,10 +657,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
                 # 5. 重新实例化优化器并加载状态
+                self._print_stage('训练', '验证结束，开始恢复优化器状态。')
                 model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-                model_optim.load_state_dict(checkpoint['optimizer_state_dict'])
+                model_optim.load_state_dict(resume_state['optimizer_state_dict'])
+                self._move_optimizer_state_to_device(model_optim)
+                del resume_state
 
-                adjust_learning_rate(model_optim, epoch, self.args)
+                adjust_learning_rate(model_optim, epoch + 1, self.args)
 
             self.best_model_file = early_stopping.best_model_file
             if not self.best_model_file:
@@ -662,8 +696,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         self.model.eval()
         stage_name = '测试'
+        total_batches = len(test_loader)
+        self._print_stage(stage_name, f'开始执行，共 {total_batches} 个 batch。')
         with torch.no_grad():
-            for i, batch in enumerate(test_loader):
+            test_pbar = tqdm(
+                test_loader,
+                desc=stage_name,
+                dynamic_ncols=True,
+                mininterval=10,
+            )
+            for i, batch in enumerate(test_pbar):
                 prepared_batch = self._prepare_batch(batch)
                 for sample_index, sample_x, sample_y, sample_x_mark, sample_y_mark in self._iter_window_batches(*prepared_batch):
                     sample_chunk_outputs = []
@@ -694,6 +736,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self._should_cleanup_after_batch(i):
                     manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
+                test_pbar.set_postfix({'samples': len(preds)})
+
         preds_tensor = torch.cat([torch.from_numpy(p) for p in preds], dim=0)
         trues_tensor = torch.cat([torch.from_numpy(t) for t in trues], dim=0)
 
@@ -713,10 +757,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 **metrics,
             },
         )
+        self._print_stage(stage_name, '执行完成。')
         manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
         return metrics
 
     def export_valid_test_factors(self, step_index=0, factor_column='factor'):
+        checkpoint_path = getattr(self.args, 'checkpoint_path', '') or getattr(self, 'best_model_file', '')
+        if checkpoint_path:
+            self._print_stage('因子导出', '按指定 checkpoint 加载模型参数。')
+            self.model.load_state_dict(load_checkpoint(checkpoint_path, self.device))
+
         result_frames = []
 
         for flag, dataset_split in (('val', 'valid'), ('test', 'test')):

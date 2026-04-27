@@ -1,7 +1,20 @@
 from data_provider.data_loader import StockDataset, StockDataset_pred_long
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from const import MIN_SAMPLE_STOCKS
+from const import MAX_SAMPLE_STOCKS
+
+
+def resolve_sample_size(raw_value, max_size=None):
+    if raw_value is None:
+        return None
+
+    sample_size = int(raw_value)
+    if sample_size <= 0:
+        return None
+
+    if max_size is not None:
+        sample_size = min(sample_size, max_size)
+    return sample_size
 
 def dynamic_stock_collate(batch):
     """
@@ -46,7 +59,14 @@ def data_provider(args, flag, print_debug):
 
     # 针对不同模式补充特殊参数
     if flag == 'train':
-        data_kwargs['stock_cap'] = min(getattr(args, 'dynamic_stock_cap', None), MIN_SAMPLE_STOCKS)
+        data_kwargs['sample_method'] = 'train_balanced'
+        data_kwargs['stock_sample_size'] = resolve_sample_size(
+            getattr(args, 'train_sample', None),
+            max_size=MAX_SAMPLE_STOCKS,
+        )
+    elif flag in ['val', 'test']:
+        data_kwargs['sample_method'] = 'random'
+        data_kwargs['stock_sample_size'] = resolve_sample_size(getattr(args, 'val_test_sample', None))
     elif flag == 'pred':
         data_kwargs['prediction_date'] = getattr(args, 'prediction_date', None)
 

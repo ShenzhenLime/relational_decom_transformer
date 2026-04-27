@@ -109,17 +109,57 @@ def build_window_code_indices(presence, required_window):
     # 找出每一天里，哪些股票的有效天数正好等于窗口长度
     return [np.flatnonzero(row == required_window) for row in v_sums]
 
+def filter_window_stock_indices(split_values, history_days, code_indices, window_start,
+                                seq_len, close_col_index,
+                                min_history_days=MIN_HISTORY_DAYS,
+                                price_limit=PRICE_LIMIT):
+    """
+    按输入窗口最后一天的可交易条件筛股票：价格不能过高，上市天数要足够。
+    """
+    if len(code_indices) == 0:
+        return np.array([], dtype=np.int64)
+
+    signal_index = window_start + seq_len - 1
+    close_values = split_values[signal_index, code_indices, close_col_index]
+    history_values = history_days[signal_index, code_indices]
+    valid_mask = (
+        np.isfinite(close_values)
+        & (close_values <= price_limit)
+        & (history_values >= min_history_days)
+    )
+    return np.asarray(code_indices[valid_mask], dtype=np.int64)
+
+def sample_stock_indices(code_indices, sample_size):
+    """
+    对股票索引做无放回随机抽样；sample_size 为空或不小于总数时返回全量。
+    """
+    if len(code_indices) == 0:
+        return np.array([], dtype=np.int64)
+
+    if sample_size is None or sample_size <= 0 or len(code_indices) <= sample_size:
+        return np.asarray(code_indices, dtype=np.int64)
+
+    sampled = np.random.permutation(code_indices)[:sample_size]
+    return np.sort(np.asarray(sampled, dtype=np.int64))
+
 def select_train_stock_indices(split_values, history_days, code_indices, window_start,
                                seq_len, pred_len, stock_cap, close_col_index,
                                min_history_days=MIN_HISTORY_DAYS, trim_ratio=JIE_WEI_RATIO):
     """
     训练集专用筛选器：通过回测收益率和上市时长，精选出一部分股票进行训练。
     """
-    # 1. 过滤掉“新股”（上市时间不足的）
     pred_start = window_start + seq_len
-    mask = history_days[pred_start, code_indices] > min_history_days
-    indices = code_indices[mask]
-    if len(indices) == 0: return indices
+    indices = filter_window_stock_indices(
+        split_values,
+        history_days,
+        code_indices,
+        window_start,
+        seq_len,
+        close_col_index,
+        min_history_days=min_history_days,
+    )
+    if len(indices) == 0:
+        return indices
 
     # 2. 计算预测时段的真实收益率(相对于预测期的前一天) (用于排序和筛选)
     f_close = split_values[pred_start - 1 : pred_start + pred_len, indices, close_col_index]
@@ -155,12 +195,13 @@ class StockDataset(Dataset):
 
     def __init__(self, root_path, data_path, flag='train', size=None,
                  features='S', target='close', scale=True, timeenc=0, freq='h', 
-                 stock_cap=None, **kwargs):
+                 stock_sample_size=None, sample_method='full', **kwargs):
         # 初始化参数
         self.seq_len, self.label_len, self.pred_len = size
         self.set_type = {'train': 0, 'val': 1, 'test': 2}[flag]
         self.target = target
-        self.stock_cap = stock_cap
+        self.stock_sample_size = stock_sample_size
+        self.sample_method = sample_method
         self.freq = freq
 
         self.root_path = root_path
@@ -206,14 +247,27 @@ class StockDataset(Dataset):
         
         self.samples = []
         for i, codes in enumerate(raw_indices):
-            if len(codes) == 0: continue
-            
-            # 如果是训练集，执行更严格的“选股筛选”（如排除新股、剔除极端收益率）
-            if self.set_type == 0:
+            if len(codes) == 0:
+                continue
+
+            codes = filter_window_stock_indices(
+                self.split_values,
+                cache['history_days'][s_idx:e_idx],
+                codes,
+                i,
+                self.seq_len,
+                self.close_col_index,
+            )
+            if len(codes) == 0:
+                continue
+
+            if self.sample_method == 'train_balanced':
                 codes = select_train_stock_indices(
                     self.split_values, cache['history_days'][s_idx:e_idx], codes, 
-                    i, self.seq_len, self.pred_len, self.stock_cap, self.close_col_index
+                    i, self.seq_len, self.pred_len, self.stock_sample_size, self.close_col_index
                 )
+            elif self.sample_method == 'random':
+                codes = sample_stock_indices(codes, self.stock_sample_size)
             
             # 如果筛选后还有股票，则记录这个“窗口日期”和对应的“股票集合”
             if len(codes) > 0:
@@ -291,8 +345,10 @@ class StockDataset_pred_long(Dataset):
 
         all_values = cache['values']
         all_presence = cache['presence']
+        all_history_days = cache['history_days']
         all_dates = cache['dates']
         all_codes = cache['codes']
+        close_col_index = cache['close_col_index']
 
         # 2. 预测基准点计算
         target_date = pd.to_datetime(self.prediction_date, format='%Y%m%d')      
@@ -321,6 +377,14 @@ class StockDataset_pred_long(Dataset):
         # presence_slice.all(axis=0) 确保在回溯窗口内每一天都有数据
         presence_slice = all_presence[lookback_start:lookback_end]
         valid_indices = np.flatnonzero(presence_slice.all(axis=0))
+        valid_indices = filter_window_stock_indices(
+            all_values[lookback_start:lookback_end],
+            all_history_days[lookback_start:lookback_end],
+            valid_indices,
+            0,
+            self.seq_len,
+            close_col_index,
+        )
         
         if len(valid_indices) == 0:
             raise ValueError("当前窗口内没有任何股票满足完整数据覆盖要求。")

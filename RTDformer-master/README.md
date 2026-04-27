@@ -69,9 +69,10 @@ python tools/prepare_local_data.py
 
 - StockDataset 会先把长表缓存成 date x stock x feature 的稠密矩阵
 - 每个样本窗口只保留在该窗口内数据完整的股票
-- 训练集还会继续做两层筛选：
-- 上市天数要超过 MIN_HISTORY_DAYS
-- 预测窗口收益率会先截去两端极端样本，再做涨跌均衡采样
+- train / val / test / pred 都会先按输入窗口最后一天做统一过滤：close 不能超过 PRICE_LIMIT，上市天数不能少于 MIN_HISTORY_DAYS
+- train 会继续按预测窗口收益率截去两端极端样本，再做涨跌均衡采样
+- val / test 会按 val_test_sample 做无放回随机抽样，用于加快评估
+- pred 保持全量股票池，只在本地推理阶段按 local_chunk_size 分块执行
 - DataLoader 用 dynamic_stock_collate 在股票维做 padding
 - 进入模型前通过 stock_mask 去掉 padding 股票
 
@@ -129,9 +130,10 @@ tensorboard --logdir results
 - results/<run>/tensorboard/：loss 曲线
 - results/<run>/checkpoint/temp_epoch_end.pt：每轮验证前的临时状态
 - results/<run>/checkpoint/train_loss*.pt：验证集最优模型
-- results/<run>/valid_test_factor.parquet：valid/test 因子导出结果
+- results/<run>/valid_test_factor.parquet：在 run=test 且提供 checkpoint_path 时生成的 valid/test 因子导出结果
 
-如果 run 不是 train，或者显式 no-save，则会使用临时目录，退出后自动清理。
+如果 run 不是 train，或者显式 no-save，则默认使用临时目录，退出后自动清理。
+例外是 run=test 且提供 checkpoint_path 时，valid/test 因子会直接写回 checkpoint 所在的 run 目录。
 
 ## 7. 云端训练建议
 
@@ -155,7 +157,7 @@ python run.py --model 3Dformer --use_gpu --use_multi_gpu --devices 0,1 --use_amp
 
 建议的调参顺序：
 
-1. 先调小 dynamic_stock_cap
+1. 先调小 train_sample / val_test_sample / local_chunk_size
 2. 再调小 batch_size
 3. 再调小 d_model 和 d_ff
 4. 最后才考虑缩短 seq_len 或 pred_len
@@ -164,9 +166,10 @@ python run.py --model 3Dformer --use_gpu --use_multi_gpu --devices 0,1 --use_amp
 
 ## 8. valid/test 因子导出
 
-train 模式下，训练和测试结束后会自动执行：
+test 模式下，完成 checkpoint 评估后会自动执行：
 
 - export_valid_test_factors(step_index=args.factor_step_index)
+- 导出时会按 checkpoint_path 重新加载模型参数
 
 导出内容：
 
@@ -176,7 +179,7 @@ train 模式下，训练和测试结束后会自动执行：
 
 导出文件：
 
-- results/<run>/valid_test_factor.parquet
+- checkpoint 所在 run 目录下的 valid_test_factor.parquet，也就是 results/<run>/valid_test_factor.parquet
 
 factor_day 的规则：
 
@@ -199,7 +202,8 @@ python run.py --run pred --checkpoint_path results/<run>/checkpoint/<best>.pt --
 当前 pred 逻辑：
 
 - 用 prediction_date 之前的 seq_len 天历史窗口构造输入
-- 对该日期对应的股票池逐块推理
+- 先按输入窗口最后一天过滤掉 close 超过 PRICE_LIMIT 或上市天数不足 MIN_HISTORY_DAYS 的股票
+- 对过滤后的全量股票池按 local_chunk_size 逐块推理
 - 生成 ts_code、trade_date、factor 三列结果
 - 如果 quant_infra 可导入，就检查 DuckDB 里该 trade_date 是否已存在
 - 不存在则追加写入 FACTOR_TABLE_NAME 对应的表

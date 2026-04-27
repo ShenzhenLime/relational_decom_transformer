@@ -14,7 +14,7 @@ prepare_torch_runtime()
 import torch
 
 from experiments.exp_simple_acc import Exp_Long_Term_Forecast
-from const import ARTIFACTS_ROOT, DATA_PATH, FACTOR_OUTPUT_FILE
+from const import ARTIFACTS_ROOT, DATA_PATH, FACTOR_OUTPUT_FILE, MAX_SAMPLE_STOCKS
 
 MODEL_CHOICES = ['FourierGNN', 'Transformer', 'TDformer', 'Informer', 'Wformer', 'iTransformer', 'RTDformer2', '3Dformer', 'FEDformer', 'PDF', 'StockMixer', 'DLinear']
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -46,7 +46,9 @@ data_group.add_argument('--seq_len', type=int, default=48, help='input sequence 
 data_group.add_argument('--label_len', type=int, default=24, help='decoder warmup length')
 data_group.add_argument('--pred_len', type=int, default=24, help='prediction horizon')
 data_group.add_argument('--factor_day', type=int, default=-1, help='1-based forecast day used as factor; use -1 for the last day in pred_len')
-data_group.add_argument('--dynamic_stock_cap', type=int, default=500, help='用于设置训练集的样本股票数量上限，以及chunk的规模大小；如果这个值大于MIN_SAMPLE_STOCKS，则会被自动调整为MIN_SAMPLE_STOCKS，以避免过大的样本规模导致训练集出现类不平衡')
+data_group.add_argument('--train_sample', type=int, default=1000, help=f'训练集每个窗口的股票抽样上限；大于 {MAX_SAMPLE_STOCKS} 时会自动截断为 {MAX_SAMPLE_STOCKS}')
+data_group.add_argument('--val_test_sample', type=int, default=500, help='验证/测试集每个窗口的随机抽样股票数；小于等于 0 表示使用全量')
+data_group.add_argument('--local_chunk_size', type=int, default=1000, help='仅本地 pred 模式使用的股票分块大小；小于等于 0 表示单次处理全部股票')
 
 model_group = parser.add_argument_group('model')
 model_group.add_argument('--enc_in', type=int, default=4, help='encoder input size')
@@ -81,8 +83,8 @@ add_bool_arg(model_group, '--output_stl', False, 'return decomposition component
 
 optimization_group = parser.add_argument_group('optimization')
 optimization_group.add_argument('--num_workers', type=int, default=1, help='dataloader workers')
-optimization_group.add_argument('--train_epochs', type=int, default=1, help='training epochs')
-optimization_group.add_argument('--batch_size', type=int, default=10, help='training batch size')
+optimization_group.add_argument('--train_epochs', type=int, default=50, help='training epochs')
+optimization_group.add_argument('--batch_size', type=int, default=25, help='training batch size')
 optimization_group.add_argument('--patience', type=int, default=3, help='early stopping patience')
 optimization_group.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
 optimization_group.add_argument('--alpha', type=float, default=0.8, help='learning rate decay factor for LambdaLR')
@@ -136,7 +138,7 @@ def resolve_runtime_paths(args, run_dir=None):
     args.checkpoint_dir = str(checkpoint_dir)
     args.args_json_path = str(run_path / 'args.json')
     args.output_json_path = str(run_path / 'output.json')
-    args.tensorboard_dir = str(run_path / 'tensorboard')
+    args.tensorboard_dir = str(run_path / 'board')
     args.factor_output_path = str(run_path / FACTOR_OUTPUT_FILE)
     return args
 
@@ -149,6 +151,30 @@ def resolve_project_path(raw_path):
     if candidate.is_absolute():
         return str(candidate)
     return str((PROJECT_ROOT / candidate).resolve())
+
+
+def resolve_checkpoint_artifact_paths(checkpoint_path):
+    checkpoint_file = Path(checkpoint_path)
+    checkpoint_dir = checkpoint_file.parent
+    run_path = checkpoint_dir.parent if checkpoint_dir.name == 'checkpoint' else checkpoint_dir
+    return run_path, checkpoint_dir
+
+
+def align_test_artifact_paths(args):
+    if args.run != 'test' or not args.checkpoint_path:
+        return args
+
+    run_path, checkpoint_dir = resolve_checkpoint_artifact_paths(args.checkpoint_path)
+    run_path.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    args.run_dir = str(run_path)
+    args.checkpoint_dir = str(checkpoint_dir)
+    args.args_json_path = str(run_path / 'args.json')
+    args.output_json_path = str(run_path / 'output.json')
+    args.tensorboard_dir = str(run_path / 'board')
+    args.factor_output_path = str(run_path / FACTOR_OUTPUT_FILE)
+    return args
 
 
 def resolve_factor_step_index(args):
@@ -213,6 +239,7 @@ if __name__ == '__main__':
 
     if args.checkpoint_path:
         args.checkpoint_path = resolve_project_path(args.checkpoint_path)
+        args = align_test_artifact_paths(args)
 
     try:
         print_args_summary(args)
@@ -224,8 +251,6 @@ if __name__ == '__main__':
             exp = Exp(args)
             exp.train(setting)
             exp.test(setting)
-            if args.save:
-                exp.export_valid_test_factors(step_index=args.factor_step_index)
             empty_cache(args.device_type)
         elif args.run == 'test':
             if not args.checkpoint_path:
@@ -237,6 +262,8 @@ if __name__ == '__main__':
             print_section('测试任务', f'实验标识: {setting}')
             print('[测试阶段] 开始评估模型')
             exp.test(setting, test=1)
+            print('[测试阶段] 开始导出 valid/test 因子')
+            exp.export_valid_test_factors(step_index=args.factor_step_index)
             empty_cache(args.device_type)
         elif args.run == 'pred':
             if not args.prediction_date:

@@ -1,4 +1,4 @@
-TRAIN_END_DATE = '2023-01-01'
+TRAIN_END_DATE = '2023-09-01'
 
 VALID_END_DATE = '2025-01-01'
 ## 后面就是测试集（一直到最后一天）
@@ -8,7 +8,9 @@ MIN_HISTORY_DAYS = 400
 ## 将涨跌幅比较大的1%的股票进行截取，以避免过于极端的样本对模型训练产生过大影响。
 JIE_WEI_RATIO = 0.01
 ## 训练集的股票上限，如果动态股票池很大，则会用以下值代替
-MIN_SAMPLE_STOCKS = 1000
+MAX_SAMPLE_STOCKS = 1000
+## 价格上限
+PRICE_LIMIT = 50
 
 DATA_PATH = 'data/a_share_dynamic.pt'
 ARTIFACTS_ROOT = 'results'

@@ -22,15 +22,15 @@ def data_provider(args, flag, print_debug):
     """
     # 1. 基础配置映射：将复杂的 if-else 归纳为逻辑判断
     is_train = (flag == 'train')
-    is_train_val = flag in ['train', 'val']
+    is_train_val_test = flag in ['train', 'val', 'test']
     is_pred = (flag == 'pred')
     
     # 模式对应的参数设置
     DataClass = StockDataset_pred_long if is_pred else StockDataset
     shuffle_flag = is_train
     drop_last = is_train
-    batch_size = args.batch_size if is_train_val else 1
-    num_workers = args.num_workers if is_train_val else 0
+    batch_size = args.batch_size if is_train_val_test else 1
+    num_workers = args.num_workers if is_train_val_test else 0
 
     # 2. 准备数据集参数
     data_kwargs = {

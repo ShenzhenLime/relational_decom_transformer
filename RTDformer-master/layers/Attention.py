@@ -33,20 +33,12 @@ class FullAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
         self.T = T
 
-    def forward(self, queries, keys, values, attn_mask, top_k=0):
+    def forward(self, queries, keys, values, attn_mask):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
 
         scores = torch.einsum("blhe,bshe->bhls", queries, keys) * scale
-
-        # 稀疏Top-K注意力（仅用于ISCA，B=pred_len, L=num_stocks, H, E）
-        if top_k and top_k > 0 and scores.shape[-1] > top_k:
-            # scores: [B, H, L, L]，对最后一维（每个query的所有key）做TopK
-            topk_val, topk_idx = torch.topk(torch.abs(scores), top_k, dim=-1)
-            mask = torch.full_like(scores, float('-inf'))
-            mask.scatter_(-1, topk_idx, topk_val)
-            scores = mask
 
         A = None
         if self.activation == 'softmax':

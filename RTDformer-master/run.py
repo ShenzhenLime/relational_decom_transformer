@@ -16,7 +16,7 @@ import torch
 from experiments.exp_simple_acc import Exp_Long_Term_Forecast
 from const import ARTIFACTS_ROOT, DATA_PATH, FACTOR_OUTPUT_FILE
 
-MODEL_CHOICES = ['FourierGNN', 'Transformer', 'TDformer', 'Informer', 'Wformer', 'iTransformer', 'RTDformer2', '3DDformer', 'FEDformer', 'PDF', 'StockMixer', 'DLinear']
+MODEL_CHOICES = ['FourierGNN', 'Transformer', 'TDformer', 'Informer', 'Wformer', 'iTransformer', 'RTDformer2', '3Dformer', 'FEDformer', 'PDF', 'StockMixer', 'DLinear']
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
@@ -35,7 +35,7 @@ general_group.add_argument('--model', type=str, default='3Dformer', choices=MODE
 general_group.add_argument('--data', type=str, default='StockDataset', help='dataset name used in experiment tags')
 general_group.add_argument('--des', type=str, default='test', help='experiment description suffix')
 general_group.add_argument('--checkpoint_path', type=str, default='', help='checkpoint path used by test/pred mode')
-add_bool_arg(general_group, '--save', True, 'persist run artifacts under results/<MM-DD-HH-mm>')
+add_bool_arg(general_group, '--save', False, 'persist run artifacts under results/<MM-DD-HH-mm>')
 
 data_group = parser.add_argument_group('data')
 data_group.add_argument('--features', type=str, default='MS', help='forecasting task mode: M / S / MS')
@@ -82,7 +82,7 @@ add_bool_arg(model_group, '--output_stl', False, 'return decomposition component
 optimization_group = parser.add_argument_group('optimization')
 optimization_group.add_argument('--num_workers', type=int, default=1, help='dataloader workers')
 optimization_group.add_argument('--train_epochs', type=int, default=1, help='training epochs')
-optimization_group.add_argument('--batch_size', type=int, default=400, help='training batch size')
+optimization_group.add_argument('--batch_size', type=int, default=10, help='training batch size')
 optimization_group.add_argument('--patience', type=int, default=3, help='early stopping patience')
 optimization_group.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
 optimization_group.add_argument('--alpha', type=float, default=0.8, help='learning rate decay factor for LambdaLR')

@@ -303,4 +303,14 @@ def oom_diagnostics_message(device_type, stage, exc):
 def load_checkpoint(path, device):
     import torch
 
-    return torch.load(path, map_location=device)
+    state_dict = torch.load(path, map_location=device)
+    if not isinstance(state_dict, dict):
+        return state_dict
+
+    if not any(key.startswith('module.') for key in state_dict.keys()):
+        return state_dict
+
+    return {
+        key.removeprefix('module.'): value
+        for key, value in state_dict.items()
+    }

@@ -179,6 +179,7 @@ class StockDataset(Dataset):
         # 1. 基础数据映射
         self.all_values = cache['values']
         self.all_dates = cache['dates']
+        self.all_codes = cache['codes']
         self.close_col_index = cache['close_col_index']
         
         # 2. 确定日期切分边界 (简化索引定位逻辑)
@@ -194,9 +195,9 @@ class StockDataset(Dataset):
         
         # 3. 提取对应时间段的数据
         self.split_values = self.all_values[s_idx:e_idx]
-        selected_dates = self.all_dates[s_idx:e_idx]
+        self.selected_dates = self.all_dates[s_idx:e_idx]
         # 时间特征编码 (用于给模型提供时间感)
-        self.data_stamp = time_features(pd.to_datetime(selected_dates), freq=self.freq).transpose(1, 0)
+        self.data_stamp = time_features(pd.to_datetime(self.selected_dates), freq=self.freq).transpose(1, 0)
 
         # 4. 构建样本索引库 (核心简化点：将所有样本信息打包进 self.samples)
         required_window = self.seq_len + self.pred_len
@@ -216,10 +217,14 @@ class StockDataset(Dataset):
             
             # 如果筛选后还有股票，则记录这个“窗口日期”和对应的“股票集合”
             if len(codes) > 0:
-                self.samples.append({'start': i, 'codes': codes})
+                self.samples.append({'start': i, 'codes': np.asarray(codes, dtype=np.int64)})
 
         if not self.samples:
             raise ValueError(f"该数据集切片 ({self.set_type}) 下没有可用的股票样本。")
+
+        self.sample_window_starts = np.asarray([sample['start'] for sample in self.samples], dtype=np.int64)
+        self.sample_code_indices = [sample['codes'] for sample in self.samples]
+        self.num_stock = max(len(code_indices) for code_indices in self.sample_code_indices)
 
     def __getitem__(self, index):
         """

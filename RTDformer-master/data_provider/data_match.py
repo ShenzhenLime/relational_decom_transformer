@@ -1,6 +1,7 @@
 from data_provider.data_loader import StockDataset, StockDataset_pred_long
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
+from const import MIN_SAMPLE_STOCKS
 
 def dynamic_stock_collate(batch):
     """
@@ -8,7 +9,6 @@ def dynamic_stock_collate(batch):
     原理：由于每组样本的股票数可能不同，我们需要用 0 (或 False) 来填充，使它们能组成 Tensor。
     """
     # 处理前 4 个数值型 Tensor (x, y, x_mark, y_mark)
-    # zip(*batch) 可以理解为把 batch 里的每个 item 拆开，按索引重新组合
     outputs = [pad_sequence([item[i] for item in batch], batch_first=True) for i in range(4)]
     
     # 特别处理第 5 个布尔型 Tensor (stock_mask)，填充值为 False
@@ -21,13 +21,14 @@ def data_provider(args, flag, print_debug):
     数据供应器：根据模式（训练、验证、测试、预测）创建对应的 Dataset 和 DataLoader。
     """
     # 1. 基础配置映射：将复杂的 if-else 归纳为逻辑判断
+    is_train = (flag == 'train')
     is_train_val = flag in ['train', 'val']
     is_pred = (flag == 'pred')
     
     # 模式对应的参数设置
     DataClass = StockDataset_pred_long if is_pred else StockDataset
-    shuffle_flag = True if is_train_val else False
-    drop_last = False if is_pred else True  # 只有预测模式不丢弃最后一个不完整的 batch
+    shuffle_flag = is_train
+    drop_last = is_train
     batch_size = args.batch_size if is_train_val else 1
     num_workers = args.num_workers if is_train_val else 0
 
@@ -45,7 +46,7 @@ def data_provider(args, flag, print_debug):
 
     # 针对不同模式补充特殊参数
     if flag == 'train':
-        data_kwargs['stock_cap'] = getattr(args, 'dynamic_stock_cap', None)
+        data_kwargs['stock_cap'] = min(getattr(args, 'dynamic_stock_cap', None), MIN_SAMPLE_STOCKS)
     elif flag == 'pred':
         data_kwargs['prediction_date'] = getattr(args, 'prediction_date', None)
 

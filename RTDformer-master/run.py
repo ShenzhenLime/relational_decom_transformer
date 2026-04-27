@@ -46,7 +46,7 @@ data_group.add_argument('--seq_len', type=int, default=48, help='input sequence 
 data_group.add_argument('--label_len', type=int, default=24, help='decoder warmup length')
 data_group.add_argument('--pred_len', type=int, default=24, help='prediction horizon')
 data_group.add_argument('--factor_day', type=int, default=-1, help='1-based forecast day used as factor; use -1 for the last day in pred_len')
-data_group.add_argument('--dynamic_stock_cap', type=int, default=10, help='cap stocks per dynamic window')
+data_group.add_argument('--dynamic_stock_cap', type=int, default=500, help='用于设置训练集的样本股票数量上限，以及chunk的规模大小；如果这个值大于MIN_SAMPLE_STOCKS，则会被自动调整为MIN_SAMPLE_STOCKS，以避免过大的样本规模导致训练集出现类不平衡')
 
 model_group = parser.add_argument_group('model')
 model_group.add_argument('--enc_in', type=int, default=4, help='encoder input size')

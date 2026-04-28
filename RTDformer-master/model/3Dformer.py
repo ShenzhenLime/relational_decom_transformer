@@ -196,8 +196,8 @@ class Model(nn.Module):
 
         dec_out = self.dec_seasonal_embedding(seasonal_dec, seasonal_mark)
         seasonal_out, attn_d = self.seasonal_decoder(dec_out, enc_out, x_mask=dec_self_mask, cross_mask=dec_enc_mask)
-        seasonal_out = seasonal_out[:, -1:, :]
-        seasonal_out = self.seasonal_gate(seasonal_out).squeeze(1)
+        seasonal_out = seasonal_out[:, -1, :]
+        seasonal_out = self.seasonal_gate(seasonal_out)
 
 
         ## === Trend（full attention）===
@@ -206,8 +206,8 @@ class Model(nn.Module):
         trend_enc_out, _ = self.trend_encoder(trend_enc_out, attn_mask=None)
         trend_dec_out = self.dec_trend_embedding(trend_dec, seasonal_mark)
         trend_out, _ = self.trend_decoder(trend_dec_out, trend_enc_out, x_mask=None, cross_mask=None)
-        trend_out = trend_out[:, -1:, :]
-        trend_out = self.trend_gate(trend_out).squeeze(1)
+        trend_out = trend_out[:, -1, :]
+        trend_out = self.trend_gate(trend_out)
 
 
         ## === Residual（RevIN → MLP → LSTM → RevIN → proj）===

@@ -84,11 +84,11 @@ python tools/prepare_local_data.py
 
 当前真实行为：
 
-- 如果提供了 checkpoint_path，train() 会从中加载模型和优化器状态后继续训练；否则从零初始化
-- train() 会依次加载 train / val / test 三个 split
-- 每轮训练结束后会把模型和优化器状态先保存到 checkpoint/temp_epoch_end.pt
-- 然后释放优化器占用，再重建模型执行 val/test
-- EarlyStopping 按验证集 loss 保存最优模型
+- 如果提供了 checkpoint_path，train() 会优先恢复 checkpoint 中的模型状态；若 checkpoint 还包含优化器、AMP scaler 和 epoch 信息，则按保存进度继续训练
+- 兼容旧格式 checkpoint：如果文件里只有纯 model.state_dict()，会只恢复模型参数，优化器从头初始化
+- train() 只加载 train / val 两个 split；训练结束后由 run.py 的 train 模式继续调用 exp.test(setting)
+- 每轮训练结束后直接在当前模型上执行验证，不再销毁并重建模型
+- EarlyStopping 按验证集 loss 保存最优 checkpoint，checkpoint 内包含继续训练所需的模型、优化器、epoch，以及可用时的 AMP scaler 状态
 - 训练结束后自动加载验证最优模型
 - run.py 的 train 模式会继续执行 exp.test(setting)
 
@@ -102,15 +102,14 @@ loss 与指标：
 
 当前代码已经接入 TensorBoard。
 
-训练时会把以下三条曲线写到当前 run 目录：
+训练时会把以下两条曲线写到当前 run 目录：
 
 - loss/train
 - loss/val
-- loss/test
 
 日志目录：
 
-- results/<MM-DD-HH-mm>/tensorboard/
+- results/<MM-DD-HH-mm>/board/
 
 查看方式：
 
@@ -128,9 +127,8 @@ tensorboard --logdir results
 
 - results/<run>/args.json：本次运行参数
 - results/<run>/output.json：关键事件日志
-- results/<run>/tensorboard/：loss 曲线
-- results/<run>/checkpoint/temp_epoch_end.pt：每轮验证前的临时状态
-- results/<run>/checkpoint/train_loss*.pt：验证集最优模型
+- results/<run>/board/：loss 曲线
+- results/<run>/checkpoint/train_loss*.pt：验证集最优 checkpoint，包含 model_state_dict、optimizer_state_dict、epoch，以及可用时的 scaler_state_dict
 - results/<run>/valid_test_factor.parquet：在 run=test 且提供 checkpoint_path 时生成的 valid/test 因子导出结果
 
 如果 run 不是 train，或者显式 no-save，则默认使用临时目录，退出后自动清理。
@@ -169,7 +167,7 @@ python run.py --model 3Dformer --use_gpu --use_multi_gpu --devices 0,1 --use_amp
 
 test 模式下，完成 checkpoint 评估后会自动执行：
 
-- export_valid_test_factors(step_index=args.factor_step_index)
+- export_valid_test_factors()
 - 导出时会按 checkpoint_path 重新加载模型参数
 
 导出内容：
@@ -182,10 +180,7 @@ test 模式下，完成 checkpoint 评估后会自动执行：
 
 - checkpoint 所在 run 目录下的 valid_test_factor.parquet，也就是 results/<run>/valid_test_factor.parquet
 
-factor_day 的规则：
-
-- factor_day=-1：取 pred_len 的最后一天
-- factor_day=1..pred_len：取预测区间中的指定第几天
+当前因子定义固定为模型最终输出那一步的上涨概率，不再提供 factor_day 这类按预测区间选第几天的旧参数。
 
 ## 9. 本地 pred
 

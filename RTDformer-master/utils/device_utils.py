@@ -271,20 +271,6 @@ def device_memory_snapshot(device_type):
     return snapshot
 
 
-def format_memory_snapshot(snapshot):
-    if not snapshot:
-        return 'memory_stats=unavailable'
-
-    def _to_gib(num_bytes):
-        return f'{num_bytes / (1024 ** 3):.2f}GiB'
-
-    ordered_keys = ['allocated', 'reserved', 'max_allocated', 'max_reserved']
-    parts = []
-    for key in ordered_keys:
-        if key in snapshot:
-            parts.append(f'{key}={_to_gib(snapshot[key])}')
-    return ', '.join(parts)
-
 
 def manage_device_memory(device_type, force_gc=False, reset_peak=False):
     if force_gc:
@@ -294,23 +280,35 @@ def manage_device_memory(device_type, force_gc=False, reset_peak=False):
     if reset_peak:
         reset_peak_memory_stats(device_type)
 
-
-def oom_diagnostics_message(device_type, stage, exc):
-    snapshot = format_memory_snapshot(device_memory_snapshot(device_type))
-    return f'[{stage}] {device_type.upper()} 内存不足: {exc}. {snapshot}'
-
-
-def load_checkpoint(path, device):
-    import torch
-
-    state_dict = torch.load(path, map_location=device)
+def _normalize_model_state_dict(state_dict):
+    """
+    多卡训练时，将模型状态字典的键值前缀 'module.' 移除
+    """
     if not isinstance(state_dict, dict):
         return state_dict
 
-    if not any(key.startswith('module.') for key in state_dict.keys()):
+    if not any(isinstance(key, str) and key.startswith('module.') for key in state_dict.keys()):
         return state_dict
 
     return {
         key.removeprefix('module.'): value
         for key, value in state_dict.items()
     }
+
+
+def load_training_checkpoint(path, device):
+    import torch
+    ## 兼容两种加载方式，如果 checkpoint 是一个包含 'model_state_dict' 键的字典，则直接返回；否则将整个 checkpoint 视为模型状态字典并进行规范化处理后返回，包含 'model_state_dict' 键的字典。
+    
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+     # 直接保存的 model.state_dict() 会进入这里
+    # 此时 checkpoint 是 OrderedDict，不是 dict
+    if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
+        return {
+            'model_state_dict': _normalize_model_state_dict(checkpoint),
+        }
+
+    # 完整 checkpoint（包含 epoch, loss 等）是 dict
+    # 但内部的 model_state_dict 仍是 OrderedDict
+    normalized_checkpoint['model_state_dict'] = _normalize_model_state_dict(checkpoint['model_state_dict'])
+    return normalized_checkpoint

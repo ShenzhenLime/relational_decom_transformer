@@ -45,7 +45,6 @@ data_group.add_argument('--prediction_date', type=str, default='', help='single 
 data_group.add_argument('--seq_len', type=int, default=48, help='input sequence length')
 data_group.add_argument('--label_len', type=int, default=24, help='decoder warmup length')
 data_group.add_argument('--pred_len', type=int, default=24, help='prediction horizon')
-data_group.add_argument('--factor_day', type=int, default=-1, help='1-based forecast day used as factor; use -1 for the last day in pred_len')
 data_group.add_argument('--train_sample', type=int, default=1000, help=f'训练集每个窗口的股票抽样上限；大于 {MAX_SAMPLE_STOCKS} 时会自动截断为 {MAX_SAMPLE_STOCKS}')
 data_group.add_argument('--val_test_sample', type=int, default=500, help='验证/测试集每个窗口的随机抽样股票数；小于等于 0 表示使用全量')
 data_group.add_argument('--local_chunk_size', type=int, default=1000, help='仅本地 pred 模式使用的股票分块大小；小于等于 0 表示单次处理全部股票')
@@ -177,24 +176,6 @@ def align_test_artifact_paths(args):
     return args
 
 
-def resolve_factor_step_index(args):
-    factor_day = int(args.factor_day)
-    if factor_day == -1:
-        step_index = args.pred_len - 1
-    else:
-        if factor_day < 1 or factor_day > args.pred_len:
-            raise ValueError(
-                f'--factor_day 必须在 [1, {args.pred_len}] 之间，或使用 -1 表示最后一天；当前为 {factor_day}。'
-            )
-        step_index = factor_day - 1
-
-    args.factor_step_index = step_index
-    return args
-
-
-args = resolve_factor_step_index(args)
-
-
 
 
 def build_setting(args, run_index):
@@ -263,7 +244,7 @@ if __name__ == '__main__':
             print('[测试阶段] 开始评估模型')
             exp.test(setting, test=1)
             print('[测试阶段] 开始导出 valid/test 因子')
-            exp.export_valid_test_factors(step_index=args.factor_step_index)
+            exp.export_valid_test_factors()
             empty_cache(args.device_type)
         elif args.run == 'pred':
             if not args.prediction_date:
@@ -272,7 +253,7 @@ if __name__ == '__main__':
                 raise ValueError('pred 模式需要提供 --checkpoint_path。')
 
             exp = Exp(args)
-            exp.predict_factor_by_date(step_index=args.factor_step_index)
+            exp.predict_factor_by_date()
             empty_cache(args.device_type)
         else:
             raise ValueError(f'不支持的 run 模式: {args.run}')

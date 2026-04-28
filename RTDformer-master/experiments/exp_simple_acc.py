@@ -21,7 +21,7 @@ from utils.device_utils import (
     autocast_context,
     create_grad_scaler,
     device_memory_snapshot,
-    load_checkpoint,
+    load_training_checkpoint,
     manage_device_memory,
 )
 
@@ -179,17 +179,54 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             return tuple(self._clone_to_cpu(item) for item in value)
         return value
 
-    def _capture_resume_state(self, model_optim):
-        return {
+    def _build_training_checkpoint(self, model_optim, epoch, train_loss=None, vali_loss=None, scaler=None):
+        checkpoint = {
             'model_state_dict': self._clone_to_cpu(self.model.state_dict()),
             'optimizer_state_dict': self._clone_to_cpu(model_optim.state_dict()),
+            'epoch': int(epoch),
         }
+        if train_loss is not None:
+            checkpoint['train_loss'] = float(train_loss)
+        if vali_loss is not None:
+            checkpoint['vali_loss'] = float(vali_loss)
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = self._clone_to_cpu(scaler.state_dict())
+        return checkpoint
 
     def _move_optimizer_state_to_device(self, optimizer):
         for state in optimizer.state.values():
             for key, value in state.items():
                 if torch.is_tensor(value):
                     state[key] = value.to(self.device)
+
+    def _resume_training_if_needed(self, model_optim, scaler=None):
+        checkpoint_path = getattr(self.args, 'checkpoint_path', '')
+        if not checkpoint_path or not Path(checkpoint_path).exists():
+            return 0
+
+        self._print_stage('训练', f'从 checkpoint 恢复训练状态: {checkpoint_path}')
+        resume_state = load_training_checkpoint(checkpoint_path, self.device)
+        self.model.load_state_dict(resume_state['model_state_dict'])
+
+        start_epoch = int(resume_state.get('epoch', 0) or 0)
+
+        optimizer_restored = False
+        if 'optimizer_state_dict' in resume_state:
+            model_optim.load_state_dict(resume_state['optimizer_state_dict'])
+            self._move_optimizer_state_to_device(model_optim)
+            optimizer_restored = True
+            adjust_learning_rate(model_optim, start_epoch, self.args)
+        else:
+            self._print_stage('训练', 'checkpoint 不包含优化器状态，将从当前模型权重继续训练并重新初始化优化器。')
+
+        if scaler is not None and 'scaler_state_dict' in resume_state:
+            scaler.load_state_dict(resume_state['scaler_state_dict'])
+
+        resume_summary = [f'epoch={start_epoch}']
+        resume_summary.append(f'optimizer_restored={optimizer_restored}')
+        resume_summary.append(f'scaler_restored={scaler is not None and "scaler_state_dict" in resume_state}')
+        self._print_stage('训练', '恢复完成: ' + ' | '.join(resume_summary))
+        return start_epoch
 
     def _get_factor_export_data(self, flag):
         data_set, _ = self._get_data(flag=flag)
@@ -203,12 +240,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         )
         return data_set, data_loader
 
-    def _extract_factor_scores(self, outputs, step_index=0):
+    def _extract_factor_scores(self, outputs):
         probabilities = torch.softmax(outputs, dim=-1)
         if probabilities.ndim == 2:
             return probabilities[:, 1]
         if probabilities.ndim == 3:
-            return probabilities[:, step_index, 1]
+            return probabilities[:, -1, 1]
         raise ValueError(f'不支持的因子输出维度: {tuple(probabilities.shape)}')
 
     def _get_trade_date(self, dataset, window_index):
@@ -221,7 +258,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             )
         return pd.Timestamp(dataset.selected_dates[target_position]).strftime('%Y%m%d')
 
-    def _collect_split_factor_frame(self, dataset, data_loader, dataset_split, factor_column='factor', step_index=0):
+    def _collect_split_factor_frame(self, dataset, data_loader, dataset_split, factor_column='factor'):
         factor_frames = []
         all_codes = np.asarray(dataset.all_codes)
 
@@ -248,7 +285,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             f'{dataset_split} 因子导出 window={window_index} chunk={chunk_index}',
                         )
                         sample_scores.append(
-                            self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
+                            self._extract_factor_scores(outputs).detach().cpu().numpy()
                         )
                 ## 合并
                 factor_scores = np.concatenate(sample_scores)
@@ -271,7 +308,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return pd.concat(factor_frames, ignore_index=True)
 
-    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor', step_index=0):
+    def _collect_prediction_factor_frame(self, pred_data, pred_loader, factor_column='factor'):
         factor_frames = []
         # 修复变量名错误 (dataset -> pred_data) 并增加空值校验
         raw_date = getattr(pred_data, 'trade_date', None)
@@ -301,7 +338,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             f'pred 因子计算 chunk={chunk_index}',
                         )
                         sample_scores.append(
-                            self._extract_factor_scores(outputs, step_index=step_index).detach().cpu().numpy()
+                            self._extract_factor_scores(outputs).detach().cpu().numpy()
                         )
 
                 factor_frames.append(
@@ -532,7 +569,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
-        test_data, test_loader = self._get_data(flag='test')
 
         self._print_stage('训练', '开始训练')
         self._save_run_config(setting)
@@ -545,24 +581,21 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         criterion = nn.NLLLoss()
 
+        scaler = None
         if self.args.use_amp:
             scaler = create_grad_scaler(self.args)
 
-        # 如果提供了 checkpoint_path，从中加载模型和优化器状态继续训练
-        if getattr(self.args, 'checkpoint_path', '') and Path(self.args.checkpoint_path).exists():
-            self._print_stage('训练', f'从 checkpoint 加载模型和优化器状态: {self.args.checkpoint_path}')
-            resume_state = torch.load(self.args.checkpoint_path, map_location=self.device, weights_only=False)
-            if 'model_state_dict' in resume_state:
-                self.model.load_state_dict(resume_state['model_state_dict'])
-            if 'optimizer_state_dict' in resume_state:
-                model_optim.load_state_dict(resume_state['optimizer_state_dict'])
-                self._move_optimizer_state_to_device(model_optim)
-            del resume_state
+        start_epoch = self._resume_training_if_needed(model_optim, scaler=scaler)
+        if start_epoch >= self.args.train_epochs:
+            raise ValueError(
+                f'checkpoint 已完成 {start_epoch} 个 epoch，当前 --train_epochs={self.args.train_epochs}。'
+                '若要继续训练，请把 --train_epochs 设为更大的总 epoch 数。'
+            )
 
         manage_device_memory(self.args.device_type, force_gc=True, reset_peak=True)
 
         try:
-            for epoch in range(self.args.train_epochs):
+            for epoch in range(start_epoch, self.args.train_epochs):
                 train_loss = []
                 self.model.train()
                 epoch_time = time.time()
@@ -615,23 +648,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         batch_pbar.set_postfix({'max_mem': f'{max_allocated_gib:.2f}GiB'})
 
                 train_loss = np.average(train_loss)
-                # 1. 将恢复训练所需状态转存到 CPU，避免验证前重新把优化器状态压回设备显存
-                self._print_stage('训练', '训练轮结束，开始转存当前模型与优化器状态到 CPU。')
-                resume_state = self._capture_resume_state(model_optim)
-
-                # 2. 彻底销毁对象并回收显存
-                # 注意：优化器占用的显存通常是模型的 2-3 倍（Adam 记录了动量等信息）
-                del self.model
-                del model_optim
-                manage_device_memory(self.args.device_type, force_gc=True)
-
-                # 3. 重新构建模型进行验证
-                self._print_stage('训练', '开始重建模型，并恢复参数用于验证。')
-                self.model = self._build_model().to(self.device)
-                self.model.load_state_dict(resume_state['model_state_dict'])
-
-                # 4. 执行验证和测试
-                # 此时显存中只有模型，没有优化器的状态，空间更充裕
                 self._print_stage('训练', '开始验证集评估。')
                 vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
 
@@ -657,18 +673,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     self.args.checkpoint_dir,
                     f"train_loss{train_loss:.7f}vali_loss{vali_loss:.7f}.pt"
                 )
-                early_stopping(vali_loss, self.model, best_model_file)
+                checkpoint_payload = self._build_training_checkpoint(
+                    model_optim,
+                    epoch=epoch + 1,
+                    train_loss=train_loss,
+                    vali_loss=vali_loss,
+                    scaler=scaler,
+                )
+                early_stopping(vali_loss, checkpoint_payload, best_model_file)
                 if early_stopping.early_stop:
                     self._print_stage('训练', '触发提前停止，结束后续轮次。')
                     break
-
-                # --- 验证结束，恢复训练状态以进入下一个 Epoch ---
-                # 5. 重新实例化优化器并加载状态
-                self._print_stage('训练', '验证结束，开始恢复优化器状态。')
-                model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-                model_optim.load_state_dict(resume_state['optimizer_state_dict'])
-                self._move_optimizer_state_to_device(model_optim)
-                del resume_state
 
                 adjust_learning_rate(model_optim, epoch + 1, self.args)
 
@@ -684,7 +699,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 }
             )
 
-            self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
+            self.model.load_state_dict(load_training_checkpoint(self.best_model_file, self.device)['model_state_dict'])
 
             return self.model
         finally:
@@ -696,7 +711,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         if test:
             self._print_stage('测试', '按需加载最优模型参数进行测试。')
-            self.model.load_state_dict(load_checkpoint(self.best_model_file, self.device))
+            self.model.load_state_dict(load_training_checkpoint(self.best_model_file, self.device)['model_state_dict'])
 
         preds = []
         trues = []
@@ -768,11 +783,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
         return metrics
 
-    def export_valid_test_factors(self, step_index=0, factor_column='factor'):
+    def export_valid_test_factors(self, factor_column='factor'):
         checkpoint_path = getattr(self.args, 'checkpoint_path', '') or getattr(self, 'best_model_file', '')
         if checkpoint_path:
             self._print_stage('因子导出', '按指定 checkpoint 加载模型参数。')
-            self.model.load_state_dict(load_checkpoint(checkpoint_path, self.device))
+            self.model.load_state_dict(load_training_checkpoint(checkpoint_path, self.device)['model_state_dict'])
 
         result_frames = []
 
@@ -783,7 +798,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 split_loader,
                 dataset_split=dataset_split,
                 factor_column=factor_column,
-                step_index=step_index,
             )
             if not split_frame.empty:
                 result_frames.append(split_frame)
@@ -820,15 +834,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self,
         table_name=FACTOR_TABLE_NAME,
         factor_column='factor',
-        step_index=0,
     ):
-        self.model.load_state_dict(load_checkpoint(self.args.checkpoint_path, self.device))
+        self.model.load_state_dict(load_training_checkpoint(self.args.checkpoint_path, self.device)['model_state_dict'])
         pred_data, pred_loader = self._get_data(flag='pred')
         result = self._collect_prediction_factor_frame(
             pred_data,
             pred_loader,
             factor_column=factor_column,
-            step_index=step_index,
         )
         if result.empty:
             raise RuntimeError(f'prediction_date={self.args.prediction_date} 未生成任何因子值。')

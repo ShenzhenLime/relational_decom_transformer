@@ -24,7 +24,7 @@ class EarlyStopping:
         self.delta = delta
         self.best_model_file = None
 
-    def __call__(self, val_loss, model, path):
+    def __call__(self, val_loss, checkpoint, path):
         if not np.isfinite(val_loss):
             self.counter += 1
             print(f'[训练] 验证集损失为非有限值: {val_loss}，跳过保存。提前停止计数: {self.counter}/{self.patience}')
@@ -35,7 +35,7 @@ class EarlyStopping:
         score = -val_loss
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
+            self.save_checkpoint(val_loss, checkpoint, path)
         elif score < self.best_score + self.delta:
         ## 验证集损失没有下降，触发早停
             self.counter += 1
@@ -45,16 +45,17 @@ class EarlyStopping:
         else:
         ## 验证集损失下降，保存模型并重置计数器
             self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
+            self.save_checkpoint(val_loss, checkpoint, path)
             self.counter = 0
 
-    def save_checkpoint(self, val_loss, model, path):
+    def save_checkpoint(self, val_loss, checkpoint, path):
         if self.verbose:
             print(f'[训练] 验证集损失下降: {self.val_loss_min:.7f} -> {val_loss:.7f}，正在保存模型。')
         parent_dir = os.path.dirname(path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
-        torch.save(model.state_dict(), path)
+        payload = checkpoint if isinstance(checkpoint, dict) else checkpoint.state_dict()
+        torch.save(payload, path)
         self.best_model_file = path
         self.val_loss_min = val_loss
 

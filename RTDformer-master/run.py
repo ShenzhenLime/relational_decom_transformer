@@ -85,9 +85,9 @@ optimization_group = parser.add_argument_group('optimization')
 optimization_group.add_argument('--num_workers', type=int, default=1, help='dataloader workers')
 optimization_group.add_argument('--train_epochs', type=int, default=50, help='training epochs')
 optimization_group.add_argument('--batch_size', type=int, default=25, help='training batch size')
-optimization_group.add_argument('--patience', type=int, default=3, help='early stopping patience')
-optimization_group.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
-optimization_group.add_argument('--alpha', type=float, default=0.8, help='learning rate decay factor for LambdaLR')
+optimization_group.add_argument('--patience', type=int, default=8, help='early stopping patience')
+optimization_group.add_argument('--learning_rate', type=float, default=0.001, help='optimizer learning rate')
+optimization_group.add_argument('--alpha', type=float, default=0.95, help='learning rate decay factor for LambdaLR')
 ## 模型的精度会有问题，导致Loss为NaN
 add_bool_arg(optimization_group, '--use_amp', False, 'enable CUDA automatic mixed precision')
 

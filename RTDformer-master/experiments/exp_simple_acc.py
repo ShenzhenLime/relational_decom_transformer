@@ -405,16 +405,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             manage_device_memory(self.args.device_type, force_gc=True)
             raise
 
-    def _extract_target_labels(self, batch_y, as_int=False):
-        """从 batch_y 中提取目标标签：取预测区间、相对seq_len最后一日的涨跌二分类"""
-        if batch_y.shape[1] < self.args.pred_len + 1:
-            raise ValueError('当前标签定义要求 label_len 至少为 1，才能以前一交易日作为涨跌基准。')
-
+    def _extract_cumulative_target_label(self, batch_y):
+        """累积收益方向标签: close[last_pred_day] / close[last_label_day] - 1 > 0 → 1 (涨) else 0"""
         f_dim = -1 if self.args.features == 'MS' else 0
-        batch_y = batch_y[:, -(self.args.pred_len + 1):, f_dim:].to(self.device)
-        batch_y = batch_y - batch_y[:, :1, :]
-        batch_y = batch_y[:, 1:, :]
-        return (batch_y > 0).int() if as_int else (batch_y > 0).float()
+        last_label = batch_y[:, self.args.label_len - 1, f_dim]
+        last_pred = batch_y[:, -1, f_dim]
+        return (last_pred > last_label).long().to(self.device)
 
     def _prepare_batch(self, batch):
         batch_x, batch_y, batch_x_mark, batch_y_mark, stock_mask = batch
@@ -504,8 +500,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             chunk_y_mark,
                             f'{stage_name} sample={sample_index} chunk={chunk_index}',
                         )
-                        targets = self._extract_target_labels(chunk_y, as_int=True).reshape(-1).to(torch.long)
-                        sample_chunk_outputs.append(outputs.reshape(-1, 2))
+                        targets = self._extract_cumulative_target_label(chunk_y)
+                        sample_chunk_outputs.append(outputs)
                         sample_chunk_targets.append(targets)
 
                     batch_outputs.append(torch.cat(sample_chunk_outputs, dim=0))
@@ -552,6 +548,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if self.args.use_amp:
             scaler = create_grad_scaler(self.args)
 
+        # 如果提供了 checkpoint_path，从中加载模型和优化器状态继续训练
+        if getattr(self.args, 'checkpoint_path', '') and Path(self.args.checkpoint_path).exists():
+            self._print_stage('训练', f'从 checkpoint 加载模型和优化器状态: {self.args.checkpoint_path}')
+            resume_state = torch.load(self.args.checkpoint_path, map_location=self.device, weights_only=False)
+            if 'model_state_dict' in resume_state:
+                self.model.load_state_dict(resume_state['model_state_dict'])
+            if 'optimizer_state_dict' in resume_state:
+                model_optim.load_state_dict(resume_state['optimizer_state_dict'])
+                self._move_optimizer_state_to_device(model_optim)
+            del resume_state
+
         manage_device_memory(self.args.device_type, force_gc=True, reset_peak=True)
 
         try:
@@ -582,8 +589,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             sample_y_mark,
                             f'{stage_name} sample={sample_index}',
                         )
-                        targets = self._extract_target_labels(sample_y, as_int=True).reshape(-1).to(torch.long)
-                        batch_outputs.append(outputs.reshape(-1, 2))
+                        targets = self._extract_cumulative_target_label(sample_y)
+                        batch_outputs.append(outputs)
                         batch_targets.append(targets)
 
                     outputs = torch.cat(batch_outputs, dim=0)
@@ -721,7 +728,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             chunk_y_mark,
                             f'{stage_name} sample={sample_index} chunk={chunk_index}',
                         )
-                        targets = self._extract_target_labels(chunk_y)
+                        targets = self._extract_cumulative_target_label(chunk_y)
                         sample_chunk_outputs.append(outputs.detach().cpu())
                         sample_chunk_targets.append(targets.detach().cpu())
 

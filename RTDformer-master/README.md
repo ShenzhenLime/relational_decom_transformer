@@ -84,6 +84,7 @@ python tools/prepare_local_data.py
 
 当前真实行为：
 
+- 如果提供了 checkpoint_path，train() 会从中加载模型和优化器状态后继续训练；否则从零初始化
 - train() 会依次加载 train / val / test 三个 split
 - 每轮训练结束后会把模型和优化器状态先保存到 checkpoint/temp_epoch_end.pt
 - 然后释放优化器占用，再重建模型执行 val/test

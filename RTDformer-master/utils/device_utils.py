@@ -310,5 +310,6 @@ def load_training_checkpoint(path, device):
 
     # 完整 checkpoint（包含 epoch, loss 等）是 dict
     # 但内部的 model_state_dict 仍是 OrderedDict
+    normalized_checkpoint = dict(checkpoint)
     normalized_checkpoint['model_state_dict'] = _normalize_model_state_dict(checkpoint['model_state_dict'])
     return normalized_checkpoint

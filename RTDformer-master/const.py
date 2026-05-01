@@ -1,4 +1,4 @@
-TRAIN_END_DATE = '2023-09-01'
+TRAIN_END_DATE = '2023-01-01'
 
 VALID_END_DATE = '2025-01-01'
 ## 后面就是测试集（一直到最后一天）

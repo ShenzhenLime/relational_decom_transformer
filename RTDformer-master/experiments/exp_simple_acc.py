@@ -27,20 +27,17 @@ from utils.device_utils import (
 
 warnings.filterwarnings('ignore')
 
-from sklearn.metrics import roc_auc_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 
 def calculate_metrics(pred, true, threshold=0.51):
     preds = torch.softmax(pred, dim=1)
     predicted_labels = (preds[:, 1] >= threshold).float()
     acc = sum(predicted_labels == true) / len(true)
-    try:
-        auc = roc_auc_score(true, preds[:, 1])
-    except ValueError:
-        auc = float('nan')
+    precision = precision_score(true, predicted_labels, average='binary', zero_division=0)
     recall = recall_score(true, predicted_labels, average='binary', zero_division=0)
     f1 = f1_score(true, predicted_labels, average='binary', zero_division=0)
-    return acc, auc, recall, f1
+    return acc, precision, recall, f1
 
 
 class Exp_Long_Term_Forecast(Exp_Basic):
@@ -59,12 +56,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def _print_stage(self, stage, message):
         print(f'[{stage}] {message}')
 
-    def _print_metric_block(self, stage, loss, acc, auc, recall, f1):
+    def _print_metric_block(self, stage, loss, acc, precision, recall, f1):
         self._print_stage(
             stage,
             (
                 f'loss={self._format_metric(loss)} | acc={self._format_metric(acc)} | '
-                f'auc={self._format_metric(auc)} | recall={self._format_metric(recall)} | '
+                f'precision={self._format_metric(precision)} | recall={self._format_metric(recall)} | '
                 f'f1={self._format_metric(f1)}'
             )
         )
@@ -558,13 +555,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self._should_cleanup_after_batch(i):
                     manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
 
-        acc, auc, recall, f1 = calculate_metrics(torch.cat(preds, dim=0), torch.cat(trues, dim=0))
+        acc, precision, recall, f1 = calculate_metrics(torch.cat(preds, dim=0), torch.cat(trues, dim=0))
         total_loss = np.average(total_loss)
         self.model.train()
         manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
         self._print_stage(stage_name, '执行完成。')
 
-        return total_loss, acc, auc, recall, f1
+        return total_loss, acc, precision, recall, f1
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -578,8 +575,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        criterion = nn.NLLLoss()
+        model_optim = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
+        criterion = nn.NLLLoss(label_smoothing=self.args.label_smoothing)
 
         scaler = None
         if self.args.use_amp:
@@ -634,10 +631,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                     if self.args.use_amp:
                         scaler.scale(loss).backward()
+                        if self.args.grad_clip > 0:
+                            scaler.unscale_(model_optim)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.args.grad_clip)
                         scaler.step(model_optim)
                         scaler.update()
                     else:
                         loss.backward()
+                        if self.args.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.args.grad_clip)
                         model_optim.step()
                     if self._should_cleanup_after_batch(i):
                         manage_device_memory(self.args.device_type, force_gc=getattr(self.args, 'xpu_force_gc', False))
@@ -649,7 +651,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 train_loss = np.average(train_loss)
                 self._print_stage('训练', '开始验证集评估。')
-                vali_loss, vali_acc, vali_auc, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
+                vali_loss, vali_acc, vali_precision, vali_recall, vali_F1 = self.vali(vali_data, vali_loader, criterion)
 
                 epoch_duration = time.time() - epoch_time
                 last_loss = loss.item()
@@ -661,7 +663,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         f'耗时: {epoch_duration:.2f}s'
                     )
                 )
-                self._print_metric_block('验证', vali_loss, vali_acc, vali_auc, vali_recall, vali_F1)
+                self._print_metric_block('验证', vali_loss, vali_acc, vali_precision, vali_recall, vali_F1)
                 self._log_loss_curves(
                     epoch=epoch + 1,
                     train_loss=train_loss,
@@ -763,12 +765,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds_tensor = torch.cat([torch.from_numpy(p) for p in preds], dim=0)
         trues_tensor = torch.cat([torch.from_numpy(t) for t in trues], dim=0)
 
-        acc, auc, recall, f1 = calculate_metrics(preds_tensor, trues_tensor)
-        self._print_metric_block('测试结果', 0.0, acc, auc, recall, f1)
+        acc, precision, recall, f1 = calculate_metrics(preds_tensor, trues_tensor)
+        self._print_metric_block('测试结果', 0.0, acc, precision, recall, f1)
 
         metrics = {
             'acc': float(acc),
-            'auc': float(auc),
+            'precision': float(precision),
             'recall': float(recall),
             'f1': float(f1),
         }
